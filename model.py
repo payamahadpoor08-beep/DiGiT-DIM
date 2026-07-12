@@ -8173,17 +8173,35 @@ class UniversalFileEncoder:
         out = self.point_cloud_encoder(xyz.contiguous(), features)
         return out.mean(dim=1)
 
+# CONSOLIDATION: unifies the former _AdaGN (line ~44891) into this class via
+# learnable_groups=False. This isn't just a bool flag over the old AdaGN --
+# the fixed-group path below now also carries two real improvements _AdaGN
+# had that AdaGN didn't: num_groups is reduced to gcd(num_groups, dim) so
+# GroupNorm never raises on a dim not evenly divisible by num_groups, and
+# the scale/shift projection is zero-initialized (a single fused Linear)
+# so this layer starts as an identity transform on x instead of a random
+# perturbation, which is the standard, more stable way to initialize a
+# conditioning layer like this (same reasoning as TaskFiLM's zero-init
+# above). _AdaGN's own extra `ea_*` introspection methods were not carried
+# over -- they're a generic, already-duplicated-elsewhere boilerplate
+# mixin (see e.g. Compressor.ea_num_parameters), not unique to _AdaGN.
 class AdaGN(nn.Module):
-    def __init__(self, dim, emb_dim, num_groups=8, learnable_groups=True, group_dropout=0.0):
+    def __init__(self, dim, emb_dim, num_groups=8, learnable_groups=True, group_dropout=0.0, eps=1e-5):
         super().__init__()
         self.learnable_groups = learnable_groups
         if learnable_groups:
             self.group_selector = nn.Linear(emb_dim, num_groups)
-            self.gn = nn.GroupNorm(num_groups, dim, affine=False)
+            self.gn = nn.GroupNorm(num_groups, dim, eps=eps, affine=False)
+            self.gamma = nn.Linear(emb_dim, dim)
+            self.beta = nn.Linear(emb_dim, dim)
         else:
-            self.gn = nn.GroupNorm(num_groups, dim, affine=False)
-        self.gamma = nn.Linear(emb_dim, dim)
-        self.beta = nn.Linear(emb_dim, dim)
+            fixed_groups = max(1, math.gcd(num_groups, dim))
+            self.gn = nn.GroupNorm(fixed_groups, dim, eps=eps, affine=False)
+            self.to_scale_shift = nn.Linear(emb_dim, dim * 2)
+            nn.init.zeros_(self.to_scale_shift.weight)
+            if self.to_scale_shift.bias is not None:
+                nn.init.zeros_(self.to_scale_shift.bias)
+        self.dim = dim
         self.group_dropout = group_dropout
 
     def forward(self, x, emb):
@@ -8194,13 +8212,19 @@ class AdaGN(nn.Module):
                 gn_out = F.group_norm(x, g+1)
                 out += group_weights[:, :, None, None, g] * gn_out
             x = out
+            if self.training and self.group_dropout > 0:
+                x = F.dropout(x, self.group_dropout)
+            gamma = self.gamma(emb).unsqueeze(-1).unsqueeze(-1)
+            beta = self.beta(emb).unsqueeze(-1).unsqueeze(-1)
+            return x * (1 + gamma) + beta
         else:
             x = self.gn(x)
-        if self.training and self.group_dropout > 0:
-            x = F.dropout(x, self.group_dropout)
-        gamma = self.gamma(emb).unsqueeze(-1).unsqueeze(-1)
-        beta = self.beta(emb).unsqueeze(-1).unsqueeze(-1)
-        return x * (1 + gamma) + beta
+            if self.training and self.group_dropout > 0:
+                x = F.dropout(x, self.group_dropout)
+            scale, shift = self.to_scale_shift(emb).chunk(2, dim=-1)
+            scale = scale.view(-1, self.dim, 1, 1)
+            shift = shift.view(-1, self.dim, 1, 1)
+            return x * (1 + scale) + shift
 
 
 def _make_decoder_args(parent_args, dim, n_heads, num_layers, max_seq_len, use_moe=True):
@@ -44888,567 +44912,8 @@ class HyperParameterTuner:
 # used throughout modern diffusion / StyleGAN-style image decoders. Kept here
 # (not in the 48 count) because several vision blocks below depend on it.
 # ============================================================================
-class _AdaGN(nn.Module):
-    def __init__(self, num_channels, emb_dim, num_groups=32, eps=1e-5):
-        super().__init__()
-        ng = math.gcd(num_groups, num_channels)
-        ng = max(1, ng)
-        self.norm = nn.GroupNorm(ng, num_channels, eps=eps, affine=False)
-        self.to_scale_shift = Linear(emb_dim, num_channels * 2)
-        # init to identity modulation
-        nn.init.zeros_(self.to_scale_shift.weight)
-        if self.to_scale_shift.bias is not None:
-            nn.init.zeros_(self.to_scale_shift.bias)
-        self.num_channels = num_channels
-
-    def forward(self, x, emb):
-        # x: (B, C, H, W); emb: (B, emb_dim)
-        h = self.norm(x)
-        ss = self.to_scale_shift(emb)                          # (B, 2C)
-        scale, shift = ss.chunk(2, dim=-1)
-        scale = scale.view(-1, self.num_channels, 1, 1)
-        shift = shift.view(-1, self.num_channels, 1, 1)
-        return h * (1 + scale) + shift
-
-    # ------------------------------------------------------------------ #
-    # Advanced engineering utilities (injected; namespaced to avoid clashes)
-    # ------------------------------------------------------------------ #
-    def ea_num_parameters(self, trainable_only=False):
-        """Total parameter count, optionally restricted to trainable tensors."""
-        return sum(p.numel() for p in self.parameters()
-                   if (p.requires_grad or not trainable_only))
-
-    def ea_parameter_stats(self):
-        """Per-tensor summary statistics — useful for spotting dead/exploded weights."""
-        stats = {}
-        for name, p in self.named_parameters():
-            with torch.no_grad():
-                pf = p.detach().float()
-                stats[name] = {
-                    "shape": tuple(p.shape),
-                    "numel": p.numel(),
-                    "mean": pf.mean().item(),
-                    "std": pf.std().item() if p.numel() > 1 else 0.0,
-                    "absmax": pf.abs().max().item(),
-                    "frac_zero": (pf == 0).float().mean().item(),
-                    "requires_grad": p.requires_grad,
-                }
-        return stats
-
-    def ea_gradient_global_norm(self, norm_type=2.0):
-        """Global norm over all parameter gradients (None grads treated as 0)."""
-        total = 0.0
-        for p in self.parameters():
-            if p.grad is not None:
-                total += p.grad.detach().float().norm(norm_type).item() ** norm_type
-        return total ** (1.0 / norm_type)
-
-    def ea_clip_gradients(self, max_norm, norm_type=2.0):
-        """In-place global gradient clipping; returns the pre-clip total norm."""
-        return torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm, norm_type).item()
-
-    def ea_zero_grad(self, set_to_none=True):
-        for p in self.parameters():
-            if p.grad is not None:
-                if set_to_none:
-                    p.grad = None
-                else:
-                    p.grad.detach_(); p.grad.zero_()
-
-    def ea_freeze(self, name_filter=None):
-        """Freeze all (or name-matching) parameters. Returns count frozen."""
-        n = 0
-        for name, p in self.named_parameters():
-            if name_filter is None or name_filter in name:
-                p.requires_grad_(False); n += 1
-        return n
-
-    def ea_unfreeze(self, name_filter=None):
-        n = 0
-        for name, p in self.named_parameters():
-            if name_filter is None or name_filter in name:
-                p.requires_grad_(True); n += 1
-        return n
-
-    def ea_weight_decay_groups(self, weight_decay=0.01):
-        """Split params into decay / no-decay groups (norms & biases excluded)."""
-        decay, no_decay = [], []
-        for name, p in self.named_parameters():
-            if not p.requires_grad:
-                continue
-            if p.ndim <= 1 or name.endswith(".bias") or "norm" in name.lower():
-                no_decay.append(p)
-            else:
-                decay.append(p)
-        return [{"params": decay, "weight_decay": weight_decay},
-                {"params": no_decay, "weight_decay": 0.0}]
-
-    def ea_l2_penalty(self, exclude_norms=True):
-        """Differentiable L2 penalty over weight matrices (for manual reg)."""
-        total = None
-        for name, p in self.named_parameters():
-            if exclude_norms and (p.ndim <= 1 or "norm" in name.lower()):
-                continue
-            term = p.pow(2).sum()
-            total = term if total is None else total + term
-        if total is None:
-            return next(self.parameters()).new_zeros(())
-        return total
-
-    def ea_memory_footprint_bytes(self, include_buffers=True):
-        """Approximate resident bytes of parameters (+ buffers)."""
-        total = sum(p.numel() * p.element_size() for p in self.parameters())
-        if include_buffers:
-            total += sum(b.numel() * b.element_size() for b in self.buffers())
-        return total
-
-    def ea_register_ema(self, decay=0.999):
-        """Create / reset an EMA shadow copy of all parameters."""
-        self._ea_ema_decay = decay
-        self._ea_ema_shadow = {name: p.detach().clone()
-                               for name, p in self.named_parameters()}
-        return len(self._ea_ema_shadow)
-
-    def ea_update_ema(self):
-        """Update EMA shadow weights; call after each optimizer step."""
-        if not hasattr(self, "_ea_ema_shadow"):
-            self.ea_register_ema()
-            return
-        d = self._ea_ema_decay
-        with torch.no_grad():
-            for name, p in self.named_parameters():
-                s = self._ea_ema_shadow.get(name)
-                if s is not None:
-                    s.mul_(d).add_(p.detach(), alpha=1 - d)
-
-    def ea_copy_ema_to_model(self):
-        """Swap EMA weights into the live model (returns a backup to restore)."""
-        if not hasattr(self, "_ea_ema_shadow"):
-            return None
-        backup = {}
-        with torch.no_grad():
-            for name, p in self.named_parameters():
-                if name in self._ea_ema_shadow:
-                    backup[name] = p.detach().clone()
-                    p.copy_(self._ea_ema_shadow[name])
-        return backup
-
-    def ea_restore_from_backup(self, backup):
-        if backup is None:
-            return
-        with torch.no_grad():
-            for name, p in self.named_parameters():
-                if name in backup:
-                    p.copy_(backup[name])
-
-    def ea_spectral_norms(self, n_power_iter=3, eps=1e-9):
-        """Estimate the spectral norm (largest singular value) of each 2-D weight."""
-        out = {}
-        for name, p in self.named_parameters():
-            if p.ndim != 2:
-                continue
-            with torch.no_grad():
-                w = p.detach().float()
-                v = torch.randn(w.shape[1], device=w.device)
-                v = v / (v.norm() + eps)
-                for _ in range(n_power_iter):
-                    u = w @ v; u = u / (u.norm() + eps)
-                    v = w.t() @ u; v = v / (v.norm() + eps)
-                out[name] = (u @ (w @ v)).item()
-        return out
-
-    def ea_condition_numbers(self, max_dim=512):
-        """Condition number of each not-too-large 2-D weight (diagnostic)."""
-        out = {}
-        for name, p in self.named_parameters():
-            if p.ndim != 2 or max(p.shape) > max_dim:
-                continue
-            with torch.no_grad():
-                try:
-                    s = torch.linalg.svdvals(p.detach().float())
-                    out[name] = (s[0] / (s[-1] + 1e-12)).item()
-                except Exception:
-                    pass
-        return out
-
-    def ea_effective_rank(self, name_filter=None, eps=1e-12):
-        """Spectral (entropy-based) effective rank of each 2-D weight."""
-        out = {}
-        for name, p in self.named_parameters():
-            if p.ndim != 2:
-                continue
-            if name_filter is not None and name_filter not in name:
-                continue
-            with torch.no_grad():
-                try:
-                    s = torch.linalg.svdvals(p.detach().float())
-                    s = s / (s.sum() + eps)
-                    ent = -(s * (s + eps).log()).sum()
-                    out[name] = ent.exp().item()
-                except Exception:
-                    pass
-        return out
-
-    def ea_sanitize(self, clip_value=None):
-        """Replace NaN/Inf parameter entries with 0 (optionally clamp). Returns #fixed."""
-        fixed = 0
-        with torch.no_grad():
-            for p in self.parameters():
-                bad = ~torch.isfinite(p)
-                if bad.any():
-                    fixed += int(bad.sum().item())
-                    p[bad] = 0.0
-                if clip_value is not None:
-                    p.clamp_(-clip_value, clip_value)
-        return fixed
-
-    def ea_add_weight_noise(self, std=1e-3, name_filter=None):
-        """Add Gaussian noise to weights (regularization / exploration). In-place."""
-        with torch.no_grad():
-            for name, p in self.named_parameters():
-                if name_filter is not None and name_filter not in name:
-                    continue
-                p.add_(torch.randn_like(p) * std)
-
-    def ea_magnitude_prune(self, sparsity=0.5, name_filter=None):
-        """Zero the smallest-magnitude weights per tensor. Returns realized sparsity."""
-        zeroed, total = 0, 0
-        with torch.no_grad():
-            for name, p in self.named_parameters():
-                if p.ndim < 2:
-                    continue
-                if name_filter is not None and name_filter not in name:
-                    continue
-                flat = p.detach().abs().flatten()
-                k = int(sparsity * flat.numel())
-                if k <= 0:
-                    continue
-                thresh = flat.kthvalue(k).values
-                mask = p.detach().abs() > thresh
-                p.mul_(mask)
-                zeroed += int((~mask).sum().item()); total += p.numel()
-        return zeroed / max(1, total)
-
-    def ea_count_nonzero(self):
-        """Per-tensor count of nonzero entries (post-pruning check)."""
-        return {name: int((p.detach() != 0).sum().item())
-                for name, p in self.named_parameters()}
-
-    def ea_save_checkpoint(self, path, extra=None):
-        """Save weights + buffers + lightweight config to disk."""
-        payload = {"state_dict": self.state_dict()}
-        if hasattr(self, "get_config"):
-            try:
-                payload["config"] = self.get_config()
-            except Exception:
-                pass
-        if extra is not None:
-            payload["extra"] = extra
-        torch.save(payload, path)
-        return path
-
-    def ea_load_checkpoint(self, path, strict=True, map_location="cpu"):
-        payload = torch.load(path, map_location=map_location)
-        sd = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
-        self.load_state_dict(sd, strict=strict)
-        return payload.get("extra") if isinstance(payload, dict) else None
-
-    def ea_clone(self):
-        """Deep clone with identical weights (new independent module)."""
-        import copy as _copy
-        twin = _copy.deepcopy(self)
-        twin.load_state_dict(self.state_dict())
-        return twin
-
-    def ea_parameters_equal(self, other, atol=1e-6):
-        """Check whether another module has (numerically) the same weights."""
-        sd1, sd2 = self.state_dict(), other.state_dict()
-        if sd1.keys() != sd2.keys():
-            return False
-        return all(torch.allclose(sd1[k].float(), sd2[k].float(), atol=atol)
-                   for k in sd1)
-
-    def ea_benchmark_forward(self, *example_inputs, iters=10, warmup=2, **kwargs):
-        """Time the forward pass; falls back to single-arg if signature differs."""
-        import time as _time
-        was_training = self.training
-        self.eval()
-        def _run():
-            try:
-                return self(*example_inputs, **kwargs)
-            except TypeError:
-                return self(example_inputs[0])
-        try:
-            with torch.no_grad():
-                for _ in range(warmup):
-                    _run()
-                t0 = _time.perf_counter()
-                for _ in range(iters):
-                    _run()
-                dt = (_time.perf_counter() - t0) / max(1, iters)
-        finally:
-            self.train(was_training)
-        return {"sec_per_iter": dt, "iters_per_sec": 1.0 / dt if dt > 0 else float("inf")}
-
-    def ea_activation_probe(self, *example_inputs, **kwargs):
-        """Run forward and report output tensor stats (NaN/Inf early-warning)."""
-        was_training = self.training
-        self.eval()
-        try:
-            with torch.no_grad():
-                try:
-                    out = self(*example_inputs, **kwargs)
-                except TypeError:
-                    out = self(example_inputs[0])
-        finally:
-            self.train(was_training)
-        t = out[0] if isinstance(out, (tuple, list)) else out
-        if not torch.is_tensor(t):
-            return {"is_tensor": False}
-        tf = t.detach().float()
-        return {"shape": tuple(t.shape), "mean": tf.mean().item(),
-                "std": tf.std().item() if t.numel() > 1 else 0.0,
-                "absmax": tf.abs().max().item(),
-                "finite": bool(torch.isfinite(tf).all().item())}
-
-    def ea_summary(self):
-        """Compact one-call health summary of the module."""
-        return {"class": type(self).__name__,
-                "num_parameters": self.ea_num_parameters(),
-                "trainable_parameters": self.ea_num_parameters(trainable_only=True),
-                "memory_bytes": self.ea_memory_footprint_bytes(),
-                "num_tensors": sum(1 for _ in self.parameters()),
-                "num_buffers": sum(1 for _ in self.buffers())}
-
-    # ------------------------------------------------------------------ #
-    # Advanced architectural / runtime capabilities (injected; `ar_` namespace)
-    # ------------------------------------------------------------------ #
-    def ar_forward_checkpointed(self, *args, **kwargs):
-        """Run this module's forward under gradient checkpointing (saves memory
-        during training by recomputing activations in the backward pass)."""
-        if self.training:
-            def _run(*a):
-                return self.forward(*a, **kwargs)
-            return torch.utils.checkpoint.checkpoint(_run, *args, use_reentrant=False)
-        return self.forward(*args, **kwargs)
-
-    def ar_fake_quantize(self, num_bits=8, name_filter=None, symmetric=True):
-        """In-place fake (de)quantization of weights to `num_bits` — lets you
-        probe a layer's robustness to post-training quantization. Returns the
-        mean absolute quantization error per affected tensor."""
-        errs = {}
-        qmax = 2 ** (num_bits - 1) - 1
-        with torch.no_grad():
-            for name, p in self.named_parameters():
-                if p.ndim < 2:
-                    continue
-                if name_filter is not None and name_filter not in name:
-                    continue
-                w = p.detach()
-                if symmetric:
-                    scale = w.abs().max() / max(qmax, 1)
-                    if scale == 0:
-                        continue
-                    q = torch.clamp(torch.round(w / scale), -qmax - 1, qmax)
-                    deq = q * scale
-                else:
-                    lo, hi = w.min(), w.max()
-                    scale = (hi - lo) / (2 ** num_bits - 1)
-                    if scale == 0:
-                        continue
-                    q = torch.round((w - lo) / scale)
-                    deq = q * scale + lo
-                errs[name] = (deq - w).abs().mean().item()
-                p.copy_(deq)
-        return errs
-
-    def ar_quantization_error(self, num_bits=8):
-        """Estimate quantization error WITHOUT modifying weights (non-destructive)."""
-        backup = {n: p.detach().clone() for n, p in self.named_parameters()}
-        errs = self.ar_fake_quantize(num_bits=num_bits)
-        with torch.no_grad():
-            for n, p in self.named_parameters():
-                if n in backup:
-                    p.copy_(backup[n])
-        return errs
-
-    def ar_parameter_sensitivity(self, *example_inputs, loss_fn=None, **kwargs):
-        """Fisher-style sensitivity = E[(grad)^2] per parameter tensor, computed
-        from one batch. High-sensitivity tensors are the ones quantization /
-        pruning should treat most carefully."""
-        was_training = self.training
-        self.train()
-        self.ea_zero_grad() if hasattr(self, "ea_zero_grad") else None
-        try:
-            out = self.forward(*example_inputs, **kwargs)
-        except TypeError:
-            out = self.forward(example_inputs[0])
-        t = out[0] if isinstance(out, (tuple, list)) else out
-        loss = (t.float().pow(2).mean() if loss_fn is None else loss_fn(t))
-        loss.backward()
-        sens = {}
-        for name, p in self.named_parameters():
-            if p.grad is not None:
-                sens[name] = p.grad.detach().float().pow(2).mean().item()
-        self.train(was_training)
-        return sens
-
-    def ar_lowrank_factorize(self, name_filter=None, rank_ratio=0.5):
-        """Estimate the reconstruction error if each 2-D weight were replaced by
-        a rank-r factorization (U S V^T truncated). Diagnostic for deciding which
-        layers can be compressed with LoRA-style factors. Non-destructive."""
-        report = {}
-        with torch.no_grad():
-            for name, p in self.named_parameters():
-                if p.ndim != 2:
-                    continue
-                if name_filter is not None and name_filter not in name:
-                    continue
-                try:
-                    U, S, Vh = torch.linalg.svd(p.detach().float(), full_matrices=False)
-                    r = max(1, int(rank_ratio * S.numel()))
-                    approx = (U[:, :r] * S[:r]) @ Vh[:r]
-                    rel_err = (approx - p.detach().float()).norm() / (p.detach().float().norm() + 1e-9)
-                    orig = p.numel()
-                    comp = r * (p.shape[0] + p.shape[1])
-                    report[name] = {"rank": r, "rel_error": rel_err.item(),
-                                    "compression": orig / max(1, comp)}
-                except Exception:
-                    pass
-        return report
-
-    def ar_apply_lowrank(self, name_filter=None, rank_ratio=0.5):
-        """Actually replace eligible 2-D weights with their truncated-SVD
-        reconstruction (in-place lossy compression). Returns tensors modified."""
-        modified = []
-        with torch.no_grad():
-            for name, p in self.named_parameters():
-                if p.ndim != 2:
-                    continue
-                if name_filter is not None and name_filter not in name:
-                    continue
-                try:
-                    U, S, Vh = torch.linalg.svd(p.detach().float(), full_matrices=False)
-                    r = max(1, int(rank_ratio * S.numel()))
-                    p.copy_(((U[:, :r] * S[:r]) @ Vh[:r]).to(p.dtype))
-                    modified.append(name)
-                except Exception:
-                    pass
-        return modified
-
-    def ar_reinit_weights(self, scheme="xavier", name_filter=None, gain=1.0):
-        """Re-initialize weight matrices with a chosen scheme (xavier / kaiming /
-        orthogonal / normal). Biases and norms are left untouched."""
-        n = 0
-        with torch.no_grad():
-            for name, p in self.named_parameters():
-                if p.ndim < 2:
-                    continue
-                if name_filter is not None and name_filter not in name:
-                    continue
-                if scheme == "xavier":
-                    nn.init.xavier_uniform_(p, gain=gain)
-                elif scheme == "kaiming":
-                    nn.init.kaiming_uniform_(p, a=math.sqrt(5))
-                elif scheme == "orthogonal":
-                    nn.init.orthogonal_(p, gain=gain)
-                else:
-                    nn.init.normal_(p, std=0.02 * gain)
-                n += 1
-        return n
-
-    def ar_track_activation_stats(self):
-        """Register forward hooks on all child modules that accumulate running
-        mean/var/absmax of their outputs. Returns a handle list to remove later."""
-        self._ar_act_stats = {}
-        handles = []
-        def _mk(name):
-            def _hook(mod, inp, out):
-                t = out[0] if isinstance(out, (tuple, list)) else out
-                if not torch.is_tensor(t):
-                    return
-                tf = t.detach().float()
-                s = self._ar_act_stats.setdefault(name, {"count": 0, "mean": 0.0,
-                                                          "absmax": 0.0})
-                s["count"] += 1
-                s["mean"] += (tf.mean().item() - s["mean"]) / s["count"]
-                s["absmax"] = max(s["absmax"], tf.abs().max().item())
-            return _hook
-        for name, mod in self.named_modules():
-            if mod is self or len(list(mod.children())) > 0:
-                continue
-            handles.append(mod.register_forward_hook(_mk(name)))
-        self._ar_act_handles = handles
-        return handles
-
-    def ar_activation_stats(self):
-        """Return accumulated activation statistics from the hooks above."""
-        return dict(getattr(self, "_ar_act_stats", {}))
-
-    def ar_remove_activation_hooks(self):
-        for h in getattr(self, "_ar_act_handles", []):
-            h.remove()
-        self._ar_act_handles = []
-
-    def ar_weight_histogram(self, bins=16):
-        """Coarse global histogram of all weight values — fast distribution check."""
-        with torch.no_grad():
-            vals = torch.cat([p.detach().float().flatten() for p in self.parameters()])
-            lo, hi = vals.min().item(), vals.max().item()
-            if hi <= lo:
-                return {"edges": [lo, hi], "counts": [vals.numel()]}
-            hist = torch.histc(vals, bins=bins, min=lo, max=hi)
-            edges = [lo + (hi - lo) * i / bins for i in range(bins + 1)]
-            return {"edges": edges, "counts": hist.int().tolist()}
-
-    def ar_dead_neuron_fraction(self, *example_inputs, threshold=1e-6, **kwargs):
-        """Fraction of output features that are (near-)constant zero across the
-        batch — a quick dead-unit detector for the final output."""
-        was_training = self.training
-        self.eval()
-        try:
-            with torch.no_grad():
-                try:
-                    out = self.forward(*example_inputs, **kwargs)
-                except TypeError:
-                    out = self.forward(example_inputs[0])
-        finally:
-            self.train(was_training)
-        t = out[0] if isinstance(out, (tuple, list)) else out
-        if not torch.is_tensor(t):
-            return 0.0
-        tf = t.detach().float()
-        feat = tf.reshape(-1, tf.shape[-1])
-        dead = (feat.abs().max(dim=0).values < threshold).float().mean().item()
-        return dead
-
-    def ar_grad_to_weight_ratio(self):
-        """Per-tensor ratio of grad-norm to weight-norm — an update-scale health
-        check (too large ⇒ unstable, ~0 ⇒ not learning). Run after backward()."""
-        out = {}
-        for name, p in self.named_parameters():
-            if p.grad is None:
-                continue
-            wn = p.detach().float().norm().item() + 1e-12
-            gn = p.grad.detach().float().norm().item()
-            out[name] = gn / wn
-        return out
-
-    def ar_compression_estimate(self, num_bits=8, lowrank_ratio=0.5):
-        """Combined estimate of how small this module could get under int
-        quantization + low-rank factorization of its matrices (bytes)."""
-        full = self.ea_memory_footprint_bytes() if hasattr(self, "ea_memory_footprint_bytes")             else sum(p.numel() * p.element_size() for p in self.parameters())
-        quant_bytes = 0
-        for p in self.parameters():
-            if p.ndim >= 2:
-                quant_bytes += p.numel() * num_bits / 8
-            else:
-                quant_bytes += p.numel() * p.element_size()
-        return {"full_bytes": full, "quantized_bytes": int(quant_bytes),
-                "compression_ratio": full / max(1, quant_bytes)}
-
-
-
+# CONSOLIDATION: _AdaGN was merged into AdaGN above (learnable_groups=False
+# path) -- see the comment on AdaGN for what was preserved.
 
 def _stochastic_depth_2d(x, p, training):
     # Per-sample drop of the residual branch (a.k.a. drop-path).
@@ -45480,9 +44945,9 @@ class ResidualBlock2d(nn.Module):
         self.use_aa = use_aa and stride > 1
 
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, 1 if self.use_aa else stride, 1, bias=False)
-        self.norm1 = _AdaGN(out_ch, emb_dim, num_groups)
+        self.norm1 = AdaGN(out_ch, emb_dim, num_groups, learnable_groups=False)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False)
-        self.norm2 = _AdaGN(out_ch, emb_dim, num_groups)
+        self.norm2 = AdaGN(out_ch, emb_dim, num_groups, learnable_groups=False)
         self.act = nn.GELU() if act == "gelu" else nn.SiLU()
 
         if in_ch != out_ch or stride != 1:
@@ -48557,9 +48022,9 @@ class StyledResBlock(nn.Module):
         self.stride = stride
         self.noise = noise
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False)
-        self.norm1 = _AdaGN(out_ch, style_dim, num_groups)
+        self.norm1 = AdaGN(out_ch, style_dim, num_groups, learnable_groups=False)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False)
-        self.norm2 = _AdaGN(out_ch, style_dim, num_groups)
+        self.norm2 = AdaGN(out_ch, style_dim, num_groups, learnable_groups=False)
         if in_ch != out_ch or stride != 1:
             self.skip = nn.Conv2d(in_ch, out_ch, 1, stride, bias=False)
         else:
@@ -49170,13 +48635,13 @@ class StyledUpsampleBlock(nn.Module):
 
         if use_pixel_shuffle:
             self.pre_conv = nn.Conv2d(in_ch, hidden * 4, 3, padding=1, bias=False)
-            self.pre_norm = _AdaGN(hidden * 4, style_dim, num_groups)
+            self.pre_norm = AdaGN(hidden * 4, style_dim, num_groups, learnable_groups=False)
             self.shuffle = nn.PixelShuffle(2)
             self.act = nn.SiLU()
         else:
             self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
             self.pre_conv = nn.Conv2d(in_ch, hidden, 3, padding=1, bias=False)
-            self.pre_norm = _AdaGN(hidden, style_dim, num_groups)
+            self.pre_norm = AdaGN(hidden, style_dim, num_groups, learnable_groups=False)
             self.act = nn.SiLU()
         self.res_block = StyledResBlock(hidden, out_ch, style_dim, num_groups=num_groups)
 
@@ -82974,27 +82439,14 @@ class FaceBeautifier(nn.Module):
     def forward(self, img):
         return self.beautify(img)
 
-class VirtualBackgroundPlus(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.segment = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 1, 3, padding=1), nn.Sigmoid()
-        )
-    def forward(self, img, background):
-        mask = self.segment(img)
-        return img * mask + background * (1 - mask)
-
-class EyeContactCorrector(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 3, 3, padding=1), nn.Tanh()
-        )
-    def forward(self, img):
-        return img + 0.1 * self.net(img)
-
+# CONSOLIDATION: VirtualBackgroundPlus and EyeContactCorrector were 2-conv-
+# layer stubs duplicating the purpose of the much fuller BackgroundReplacer
+# (DeepLabv3 segmentation + learned blend/lighting/depth, line ~62763) and
+# GazeCorrector (mediapipe iris tracking + temporal smoothing, line ~63226)
+# respectively, adding nothing the fuller classes didn't already cover.
+# Neither stub's instance attribute (self.virtual_bg / self.eye_contact) was
+# ever called anywhere in the file -- only constructed -- so removing them
+# and pointing their two construction sites at the real classes is safe.
 class DeepfakeDetector(nn.Module):
     def __init__(self):
         super().__init__()
@@ -86890,9 +86342,9 @@ class Transformer(nn.Module):
         if getattr(args, 'use_gesture_recognizer', False):
             self.gesture_recognizer = GestureRecognizer()
         if getattr(args, 'use_virtual_background_plus', False):
-            self.virtual_bg = VirtualBackgroundPlus()
+            self.virtual_bg = BackgroundReplacer()
         if getattr(args, 'use_eye_contact_corrector', False):
-            self.eye_contact = EyeContactCorrector()
+            self.eye_contact = GazeCorrector(args.dim)
         if getattr(args, 'use_call_summarizer', False):
             self.call_summarizer = CallSummarizer(args.dim)
         if getattr(args, 'use_neuro_symbolic_bridge', False):
