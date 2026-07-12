@@ -85895,6 +85895,11 @@ class AIDirectorRL(nn.Module):
             scene['pacing'] = pace
         return scenes
 
+# BUGFIX: missing @dataclass meant field(default_factory=...) attributes stayed
+# raw dataclasses.Field sentinels, __post_init__ was never invoked, and
+# derive_inference_args()'s ModelArgs(**self.__dict__) had nothing to unpack
+# (self.__dict__ was empty with no generated __init__).
+@dataclass
 class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 25_000_000
@@ -85961,7 +85966,15 @@ class ModelArgs:
     use_latent_attention: bool = True
     kv_lora_rank: int = 24576
     q_lora_rank: int = 36864
-    o_lora_rank: int = 36864
+    # BUGFIX: o_lora_rank must not exceed group_dim = (n_heads // o_groups) *
+    # head_dim, enforced by __post_init__ below -- but that check never ran
+    # before the @dataclass fix above. With the other defaults on this class
+    # (n_heads=384, o_groups=16, head_dim=256 -> group_dim=6144), the old
+    # value of 36864 (copy-pasted from q_lora_rank/kv_lora_rank, whose bound
+    # is the much larger `dim`) violated the invariant on construction.
+    # Picked conservatively as roughly half of group_dim; revisit with actual
+    # model-design intent if a different rank is wanted.
+    o_lora_rank: int = 3072
     o_groups: int = 16
 
     use_deepseek_moe: bool = True
@@ -86236,14 +86249,20 @@ class ModelArgs:
 
     @staticmethod
     def _generate_dynamic_compress_ratios() -> Tuple[int, ...]:
-        n = 400
+        # BUGFIX: `n` and the final stage boundary were hardcoded to 400
+        # while n_layers defaults to 480, so a bare ModelArgs() violated
+        # its own __post_init__ invariant (len(compress_ratios) ==
+        # n_layers). This was masked before the @dataclass fix above,
+        # since __post_init__ never ran. Both now track n_layers so the
+        # generated tuple always has exactly n_layers entries.
+        n = ModelArgs.n_layers
         stages = [
             (0, 4),
             (80, 8),
             (160, 16),
             (240, 32),
             (320, 64),
-            (400, 128)
+            (n, 128)
         ]
         ratios = []
         for i in range(n):
