@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# BUGFIX: 33 bare `except:` clauses throughout this file were changed to
+# `except Exception:` (behavior-preserving for normal error handling, but no
+# longer swallows KeyboardInterrupt/SystemExit/GeneratorExit).
 from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -16,6 +21,7 @@ import smtplib
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import warnings
@@ -23,6 +29,13 @@ import xml.etree.ElementTree as ET
 from collections import OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+# BUGFIX: datetime/timedelta were used throughout (e.g. datetime.fromtimestamp(),
+# datetime.now(), timedelta(days=i)) with no import at all -- NameError on any
+# code path that hit them. textwrap/inspect/concurrent.futures had the same
+# problem (used bare, never imported at module scope).
+from datetime import datetime, timedelta
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from functools import lru_cache
 from typing import (Any, Callable, Dict, List, Literal, Optional, Tuple, Union)
@@ -38,8 +51,12 @@ from torch import Tensor
 from torch.amp import custom_fwd, custom_bwd
 
 try:
-    from cryptography.hazmat.primitives.asymmetric import rsa, padding as crypto_padding, ec
-    from cryptography.hazmat.primitives import hashes as crypto_hashes, serialization as crypto_serialization
+    # BUGFIX: these were aliased to crypto_padding/crypto_hashes/crypto_serialization,
+    # which nothing in the file ever referenced -- every real call site (OutputSigner,
+    # UserEncryptionManager) uses the bare names padding/hashes/serialization, so those
+    # calls raised NameError whenever HAS_CRYPTO code paths actually ran.
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding, ec
+    from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     from cryptography.hazmat.backends import default_backend
@@ -98,6 +115,13 @@ except ImportError:
     HAS_PYNVML = False
 
 try:
+    import pkcs11
+    HAS_PKCS11 = True
+except ImportError:
+    HAS_PKCS11 = False
+    pkcs11 = None
+
+try:
     import whisper
     HAS_WHISPER = True
 except ImportError:
@@ -128,7 +152,10 @@ except ImportError:
     aiohttp = None
 
 try:
-    from PIL import Image
+    # BUGFIX: only Image was imported, but ImageDraw/ImageFont are used
+    # extensively (subtitle/panel/comic rendering) -- undefined names on
+    # any HAS_PIL-gated code path that actually drew text/shapes.
+    from PIL import Image, ImageDraw, ImageFont
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -210,7 +237,7 @@ def get_gpu_arch():
                 return 'A100'
             if 'MI300' in name:
                 return 'MI300X'
-        except:
+        except Exception:
             pass
     return 'generic'
 
@@ -799,7 +826,7 @@ class TritonGEMMAutotuner:
                 if t < best_time:
                     best_time = t
                     best_name = name
-            except:
+            except Exception:
                 pass
         self.cache[key] = best_name
         self.save_cache()
@@ -937,11 +964,14 @@ if HAS_TILELANG:
                         q_local[i] = T.if_then_else(var_local[i] > 0.1, 8, 4)
                         if q_local[i] == 8:
                             s_local[i] = amax_local[i] * fp8_max_inv
-                            y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max)
+                            # BUGFIX: undefined loop var 'j' -- this assigns the whole
+                            # row (group_size is the vectorized free dim, already
+                            # reduced over via reduce_absmax(..., dim=1) above).
+                            y_local[i, :] = T.clamp(x_local[i, :] / s_local[i], fp8_min, fp8_max)
                         else:
                             fp4_max_val = 6.0
                             s_local[i] = fast_round_scale(amax_local[i], 1.0/fp4_max_val)
-                            y_local[i, j] = T.Cast(out_dtype, T.clamp(x_local[i, j] / s_local[i], -fp4_max_val, fp4_max_val))
+                            y_local[i, :] = T.Cast(out_dtype, T.clamp(x_local[i, :] / s_local[i], -fp4_max_val, fp4_max_val))
                     for i in T.Parallel(blk_m):
                         S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
                         Q[pid_m * blk_m + i, pid_n] = q_local[i]
@@ -1191,7 +1221,11 @@ else:
         return act_quant(x, block_size, inplace=inplace)
 
     def fp4_sparse_gemm(a, a_s, b, b_s, mask, scale_dtype=torch.float32):
-        return fp4_gemm_triton_fallback(a, a_s, b, b_s, scale_dtype)
+        # BUGFIX: referenced fp4_gemm_triton_fallback, which was never defined
+        # anywhere. fp4_gemm_triton_kernel (line ~351) is plain PyTorch (no
+        # triton dependency) and is exactly the right no-triton fallback --
+        # it's what the HAS_TRITON branch's own fp4_sparse_gemm calls too.
+        return fp4_gemm_triton_kernel(a, a_s, b, b_s, scale_dtype)
 
     def flash_sparse_attn_triton(q, kv, attn_sink, topk_idxs, softmax_scale):
         return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
@@ -3726,6 +3760,130 @@ class UnifiedSMMQP(nn.Module):
         self._act_handle = self.register_forward_pre_hook(lambda m, i: _hook(m, i, None))
         self._act_hooked = True
 
+
+# BUGFIX: TaskEmbedding and the six convert_to_* functions below were called
+# from Transformer.__init__/_apply_q_conversion (default q_mode="standard"
+# hits convert_to_q_parameters unconditionally) and from build_310t_meta_model,
+# but none of them were defined anywhere in the file -- NameError on model
+# construction. UnifiedSMMQP.convert/from_linear (above) already implement the
+# real "walk a model and replace linear-like layers" traversal, so these are
+# thin, mode-specific wrappers around that existing machinery rather than a
+# second implementation of the same traversal.
+class TaskEmbedding(nn.Module):
+    """Learned per-task embedding lookup used for task-conditioning (see
+    TaskFiLM) and passed into Block.forward as task_emb.
+
+    Position in pipeline: invoked once per forward pass in Transformer to
+    turn integer task_ids into the task_emb vector consumed by each
+    Block's TaskFiLM layers.
+    Thread-safety: a plain nn.Embedding wrapper; same guarantees as any
+    other stateless (parameters aside) nn.Module.
+    """
+
+    def __init__(self, num_tasks: int, embed_dim: int):
+        super().__init__()
+        self.embedding = nn.Embedding(num_tasks, embed_dim)
+
+    def forward(self, task_ids: Tensor) -> Tensor:
+        return self.embedding(task_ids)
+
+
+def _resolve_q_init(q_init_type: str):
+    """Parses 'family_scale' strings (e.g. 'normal_1.0') into a
+    (gen_init, q_init) pair matching UnifiedSMMQP's gen_init/q_init params."""
+    if "_" in q_init_type:
+        family, _, scale = q_init_type.rpartition("_")
+        try:
+            return family, float(scale)
+        except ValueError:
+            return q_init_type, 1.0
+    return q_init_type, 1.0
+
+
+_Q_MODE_TO_SMMQP_MODE = {
+    "standard": UnifiedSMMQP.MODE_STORED,
+    "hierarchical": UnifiedSMMQP.MODE_HIERARCHICAL,
+    "neural_memory": UnifiedSMMQP.MODE_NEURAL_MEMORY,
+    # UnifiedSMMQP has no distinct "distributed" mode -- it's a use_distributed
+    # flag orthogonal to mode -- so this falls back to the same stored baseline
+    # as "standard" and use_distributed=True is set explicitly below.
+    "distributed": UnifiedSMMQP.MODE_STORED,
+}
+
+
+def convert_to_q_parameters(model, bundle_size, device_base, cache_size, base_dtype,
+                             skip_layer_names, save_base_weights, q_init_type='normal_1.0',
+                             mode='standard'):
+    """Replaces model's linear layers with UnifiedSMMQP for the standard/
+    hierarchical/neural_memory/distributed ModelArgs q_modes."""
+    smmqp_mode = _Q_MODE_TO_SMMQP_MODE.get(mode, UnifiedSMMQP.MODE_STORED)
+    gen_init, q_init = _resolve_q_init(q_init_type)
+    extra = dict(gen_init=gen_init, q_init=q_init)
+    if mode == "distributed":
+        extra["use_distributed"] = True
+        extra["world_size"] = globals().get("world_size", 1)
+        extra["rank"] = globals().get("rank", 0)
+    return UnifiedSMMQP.convert(
+        model, mode=smmqp_mode, bundle_size=bundle_size, cache_size=cache_size,
+        skip_names=skip_layer_names, base_device=device_base, base_dtype=base_dtype,
+        store_base=save_base_weights, **extra,
+    )
+
+
+def convert_to_adaptive_smmqp(model, args, device_base=None, cache_size=1024,
+                               base_dtype=torch.float16, save_base_weights=True,
+                               skip_layer_names=None):
+    """Replaces model's linear layers with UnifiedSMMQP in hybrid (stored +
+    generative) mode for ModelArgs q_mode="adaptive"."""
+    device_base = device_base if device_base is not None else torch.device('cpu')
+    return UnifiedSMMQP.convert(
+        model, mode=UnifiedSMMQP.MODE_HYBRID, bundle_size=args.q_bundle_size,
+        cache_size=cache_size, skip_names=skip_layer_names,
+        base_device=device_base, base_dtype=base_dtype, store_base=save_base_weights,
+        seed=args.q_seed,
+    )
+
+
+def convert_to_smmqp_deterministic(model, bundle_size, seed, cache_size, device_base,
+                                    use_accumulator, skip_layer_names):
+    """Replaces model's linear layers with UnifiedSMMQP in deterministic mode
+    for ModelArgs q_mode="deterministic". use_accumulator maps to
+    UnifiedSMMQP's use_cache -- the closest existing knob for "reuse a
+    running accumulated value instead of recomputing it"."""
+    return UnifiedSMMQP.convert(
+        model, mode=UnifiedSMMQP.MODE_DETERMINISTIC, bundle_size=bundle_size,
+        cache_size=cache_size, skip_names=skip_layer_names,
+        base_device=device_base, seed=seed, use_cache=bool(use_accumulator),
+    )
+
+
+def convert_to_smmqp_predictive(model, bundle_size, seed, cache_size, device_base,
+                                 metaq_hidden_dim, use_accumulator, base_stored=True,
+                                 base_dtype=torch.float16, save_base_weights=True,
+                                 skip_layer_names=None):
+    """Replaces model's linear layers with UnifiedSMMQP in predictive mode
+    for ModelArgs q_mode="predictive". metaq_hidden_dim maps directly to
+    UnifiedSMMQP's predictive_hidden."""
+    return UnifiedSMMQP.convert(
+        model, mode=UnifiedSMMQP.MODE_PREDICTIVE, bundle_size=bundle_size,
+        cache_size=cache_size, skip_names=skip_layer_names,
+        base_device=device_base, base_dtype=base_dtype,
+        store_base=save_base_weights if base_stored else False,
+        seed=seed, use_cache=bool(use_accumulator), predictive_hidden=metaq_hidden_dim,
+    )
+
+
+def convert_to_zero_mass(model, bundle_size, cache_size, seed_init=42, rank=0,
+                          world_size=1, skip_layer_names=None):
+    """Replaces model's linear layers with UnifiedSMMQP in generative mode
+    with store_base=False for ModelArgs q_mode="zero_mass" -- weights are
+    reconstructed on the fly rather than stored, hence "zero mass"."""
+    return UnifiedSMMQP.convert(
+        model, mode=UnifiedSMMQP.MODE_GENERATIVE, bundle_size=bundle_size,
+        cache_size=cache_size, skip_names=skip_layer_names,
+        store_base=False, seed=seed_init,
+        use_distributed=world_size > 1, world_size=world_size, rank=rank,
+    )
 
 
 class PerformanceDashboard:
@@ -7481,6 +7639,46 @@ class DeepSeekMoE(nn.Module):
             self._balance_loss = 0.0
         return y.type_as(x).view(shape)
 
+# BUGFIX: TaskFiLM was referenced by Block (task_film_attn/task_film_ffn,
+# used below at self.task_film_attn(x, task_emb)) but never defined
+# anywhere in the file -- NameError as soon as use_task_condition=True.
+# Standard FiLM conditioning: project the task embedding to a per-channel
+# (scale, shift) pair and apply x * (1 + scale) + shift. Scale/shift start
+# at ~0 (zero-initialized final layer) so an untrained TaskFiLM starts as
+# an identity map, matching how conditioning adapters elsewhere in this
+# file (e.g. AdaGN) are initialized to not perturb the base model early
+# in training.
+class TaskFiLM(nn.Module):
+    """FiLM-style task conditioning: modulates a `dim`-wide feature with a
+    per-task (scale, shift) pair derived from a `task_embed_dim`-wide
+    task embedding.
+
+    Position in pipeline: applied inside Block's attention/FFN paths when
+    args.use_task_condition is set, between the sub-layer's output and the
+    residual add.
+    Thread-safety: stateless aside from its own nn.Module parameters;
+    safe to call concurrently from multiple threads given separate inputs,
+    same as any other nn.Module forward.
+    """
+
+    def __init__(self, dim: int, task_embed_dim: int):
+        super().__init__()
+        self.to_film = nn.Linear(task_embed_dim, dim * 2)
+        nn.init.zeros_(self.to_film.weight)
+        nn.init.zeros_(self.to_film.bias)
+
+    def forward(self, x: Tensor, task_emb: Tensor) -> Tensor:
+        scale, shift = self.to_film(task_emb).chunk(2, dim=-1)
+        # task_emb is one vector per batch item (batch, task_embed_dim), but x
+        # carries a sequence dim (batch, seq_len, dim); insert the broadcast
+        # dim explicitly rather than relying on torch's leading-dim padding,
+        # which would misalign batch against seq_len instead of broadcasting
+        # across it.
+        while scale.dim() < x.dim():
+            scale = scale.unsqueeze(-2)
+            shift = shift.unsqueeze(-2)
+        return x * (1.0 + scale) + shift
+
 class Block(nn.Module):
     def __init__(self, layer_id, args):
         super().__init__()
@@ -7854,7 +8052,7 @@ class UniversalFileEncoder:
             self.point_cloud_encoder = pointnet2_modules.PointnetSAModuleMSG(
                 npoint=512, radii=[0.1, 0.2, 0.4], nsamples=[16, 32, 64],
                 in_channel=self.dim, mlp=[[self.dim, self.dim, self.dim]])
-        except:
+        except Exception:
             pass
 
     def _encode_uncached(self, input_data, modality='text', **kwargs):
@@ -59583,7 +59781,11 @@ class MetaLearner(nn.Module):
         for name in self.adapter_names:
             mod = self._get_module(name)
             if hasattr(mod, 'fast_adapt'):
-                l, A, B = mod.fast_adapt(sx, sy, qx, loss_fn)
+                # BUGFIX: qy (query_y) was available in this scope but never passed
+                # through, so fast_adapt's own query_y reference below was an
+                # undefined name -- meta_loss = loss_fn(query_logits, query_y) could
+                # never have run.
+                l, A, B = mod.fast_adapt(sx, sy, qx, qy, loss_fn)
                 ml[name] = l
                 A_d[name] = A
                 B_d[name] = B
@@ -59593,6 +59795,49 @@ class MetaLearner(nn.Module):
         logits = torch.stack([clf(x) for clf in self.ood_classifiers])
         probs = F.softmax(logits / self.ood_temperature, dim=-1)
         return probs.mean(dim=0)[..., 1]
+
+# BUGFIX: RotaryPositionalEmbedding was referenced by CrossTaskAttention
+# (self.rope(x) below) but never defined anywhere in the file. There is an
+# existing functional apply_rotary_emb(x, freqs_cis) (line ~2081) used by
+# MultiHeadLatentAttention, but it expects a separately-precomputed
+# freqs_cis and is applied to per-head q/k tensors, not a self-contained
+# module callable as self.rope(x) on the raw (batch, seq_len, dim)
+# features the way CrossTaskAttention uses it -- so this is a standalone,
+# standard RoPE module rather than a duplicate of that helper.
+class RotaryPositionalEmbedding(nn.Module):
+    """Applies rotary position embeddings directly to a (..., seq_len, dim)
+    tensor's feature channels (paired as (2i, 2i+1)), rather than to
+    separate per-head query/key projections.
+
+    Position in pipeline: a stateless positional-conditioning stage used by
+    CrossTaskAttention ahead of its attention call.
+    Thread-safety: holds only registered (non-persistent) buffers computed
+    once at construction; safe for concurrent forward() calls.
+    """
+
+    def __init__(self, dim: int, max_len: int = 10000, base: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"RotaryPositionalEmbedding: dim must be even, got {dim}")
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        positions = torch.arange(max_len, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        seq_len = x.size(-2)
+        if seq_len > self.cos_cached.size(0):
+            raise ValueError(
+                f"RotaryPositionalEmbedding: seq_len {seq_len} exceeds max_len {self.cos_cached.size(0)}"
+            )
+        cos = self.cos_cached[:seq_len].to(dtype=x.dtype, device=x.device)
+        sin = self.sin_cached[:seq_len].to(dtype=x.dtype, device=x.device)
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        rotated = torch.empty_like(x)
+        rotated[..., 0::2] = x1 * cos - x2 * sin
+        rotated[..., 1::2] = x1 * sin + x2 * cos
+        return rotated
 
 class CrossTaskAttention(nn.Module):
     def __init__(self, dim, num_heads=128, dropout=0.1, memory_slots=64, use_rope=False, max_len=10000):
@@ -59751,6 +59996,17 @@ def build_310t_meta_model(vocab_size=256000, num_layers=6200, dim=65536, heads=2
         num_attention_heads=heads,
         max_position_embeddings=max_seq_len,
     )
+    # KNOWN GAP (not fixed this pass): MetaTransformerForCausalLM and
+    # inject_moe (below) are referenced here but not defined anywhere in
+    # the file. Unlike TaskFiLM/RotaryPositionalEmbedding/TaskEmbedding,
+    # their call sites don't fully pin down an interface (what base class
+    # MetaTransformerForCausalLM should extend, what forward()/generate()
+    # contract it needs to satisfy for MetaLearner/FSDP below, which layer
+    # attribute inject_moe should walk) -- this function is also never
+    # called elsewhere in the file, so it's not on the default-construction
+    # path the other q-conversion fixes were on. Implementing these for
+    # real needs actual design input rather than a guessed class hierarchy;
+    # see ARCHITECTURE.md.
     model = MetaTransformerForCausalLM(config)
     if use_smmqp:
         convert_to_q_parameters(model, bundle_size=smmqp_bundle_size, device_base=torch.device('cpu'),
@@ -59771,6 +60027,8 @@ def build_310t_meta_model(vocab_size=256000, num_layers=6200, dim=65536, heads=2
                        meta_optimizer="lamb", use_lookahead_meta=True,
                        dynamic_task_sampling=True, ood_ensemble_size=5)
     if world_size > 1:
+        # BUGFIX: FSDP was used without any import anywhere in the file.
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         meta = FSDP(meta, sharding_strategy="HYBRID_SHARD", mixed_precision=torch.float16,
                     device_id=torch.cuda.current_device())
     return meta
@@ -59817,7 +60075,7 @@ class DOCXRenderer:
         if not HAS_DOCX: raise ImportError("python-docx required")
         if structure is None:
             try: structure = json.loads(content)
-            except: structure = None
+            except Exception: structure = None
         doc = DocxDocument(template) if template else DocxDocument()
         if structure and 'paragraphs' in structure:
             for pdata in structure['paragraphs']:
@@ -59846,7 +60104,7 @@ class PDFRenderer:
         if not HAS_REPORTLAB: raise ImportError("reportlab required")
         if structure is None:
             try: structure = json.loads(content)
-            except: structure = None
+            except Exception: structure = None
         buf = io.BytesIO()
         doc = SimpleDocTemplate(buf, pagesize=A4)
         styles = getSampleStyleSheet()
@@ -59876,7 +60134,7 @@ class PPTXRenderer:
         if not HAS_PPTX: raise ImportError("python-pptx required")
         if structure is None:
             try: structure = json.loads(content)
-            except: structure = None
+            except Exception: structure = None
         prs = Presentation(template) if template else Presentation()
         if structure and 'slides' in structure:
             for sdata in structure['slides']:
@@ -60130,9 +60388,16 @@ class SmartCheckpointManager:
                 t.join(timeout=1)
             self._async_threads.clear()
 
-# -*- coding: utf-8 -*-
-
-from __future__ import annotations
+# BUGFIX: this file was merged from (at least) two source files, and the
+# second one's header duplicated `# -*- coding: utf-8 -*-` and
+# `from __future__ import annotations` here. A __future__ import anywhere
+# but the very top of a file is a hard SyntaxError ("from __future__
+# imports must occur at the beginning of the file") -- the whole file
+# failed to compile/import until this was removed. annotations behavior
+# is already active file-wide via the real from __future__ import at the
+# top of the file (line 6), so nothing else here changes; the rest of
+# this block's imports are left as-is (redundant with top-level imports
+# in places, but redundant imports aren't a correctness bug).
 import asyncio, base64, hashlib, hmac, io, json, logging, math
 import os, queue, re, secrets, subprocess, sys, tempfile, threading, time
 import warnings
@@ -80714,7 +80979,7 @@ class UsageAnalyzer:
             buckets = dict(self._daily_buckets)
         summaries = []
         for i in range(days - 1, -1, -1):
-            d = (datetime.now() - __import__('datetime').timedelta(days=i)).strftime('%Y-%m-%d')
+            d = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
             data = buckets.get(d, {})
             summaries.append({
                 'date': d,
@@ -81857,7 +82122,11 @@ class OutputSigner:
         self.use_hsm = use_hsm
         self.algorithm = algorithm
         if use_hsm:
-            import pkcs11
+            # BUGFIX: pkcs11 was imported locally here only, so sign()/verify()
+            # below raised NameError on pkcs11.Mechanism.* despite use_hsm=True
+            # working fine through __init__. Now imported at module scope.
+            if not HAS_PKCS11:
+                raise RuntimeError("pkcs11 not available; install python-pkcs11 to use use_hsm=True")
             lib = pkcs11.lib(hsm_config['lib_path'])
             self.token = lib.get_token(token_label=hsm_config.get('token_label'))
             with self.token.open(user_pin=hsm_config.get('user_pin')) as session:
@@ -82009,7 +82278,7 @@ class SystemToolkit:
     def _is_safe(self, path):
         try:
             real = os.path.realpath(path)
-        except:
+        except Exception:
             return False
         return any(os.path.commonpath([real, d]) == d for d in self.allowed_dirs)
 
@@ -82033,7 +82302,7 @@ class SystemToolkit:
                 import zstandard as zstd
                 dctx = zstd.ZstdDecompressor()
                 try: content = dctx.decompress(content)
-                except: pass
+                except Exception: pass
             return content.decode('utf-8', errors='replace')
         except Exception as e:
             return f"Error: {e}"
@@ -82220,7 +82489,7 @@ class ModelHealthMonitor:
             self._gpu_count = pynvml.nvmlDeviceGetCount()
             self._nvml_available = True
             self._pynvml = pynvml
-        except:
+        except Exception:
             self._nvml_available = False
 
     def start(self):
@@ -82257,12 +82526,12 @@ class ModelHealthMonitor:
                 try:
                     temp = self._pynvml.nvmlDeviceGetTemperature(handle, self._pynvml.NVML_TEMPERATURE_GPU)
                     metrics[f'gpu_{i}_temp_c'] = temp
-                except:
+                except Exception:
                     pass
                 try:
                     power = self._pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
                     metrics[f'gpu_{i}_power_w'] = power
-                except:
+                except Exception:
                     pass
         cache_hits = 0
         cache_misses = 0
@@ -82284,7 +82553,7 @@ class ModelHealthMonitor:
             try:
                 with open(self.metrics_log_file, 'a') as f:
                     f.write(json.dumps(metrics) + '\n')
-            except:
+            except Exception:
                 pass
 
     def _check_alerts(self, metrics):
@@ -82314,20 +82583,20 @@ class ModelHealthMonitor:
             msg['To'] = self.alert_email
             with smtplib.SMTP('localhost') as s:
                 s.send_message(msg)
-        except:
+        except Exception:
             pass
 
     def _send_webhook_alert(self, alerts):
         try:
             requests.post(self.alert_webhook, json={'alerts': alerts}, timeout=5)
-        except:
+        except Exception:
             pass
 
     def _send_slack_alert(self, alerts):
         try:
             payload = {'text': "*Model Health Alert*\n" + "\n".join(alerts)}
             requests.post(self.alert_slack_webhook, json=payload, timeout=5)
-        except:
+        except Exception:
             pass
 
 # ---------- MAMLAdapter ----------
@@ -82398,7 +82667,7 @@ class MAMLAdapter(nn.Module):
             delta = delta.half()
         return x + delta * self.adapt_scale
 
-    def fast_adapt(self, support_x, support_y, query_x, loss_fn):
+    def fast_adapt(self, support_x, support_y, query_x, query_y, loss_fn):
         A = self.A.detach().requires_grad_(True)
         B = self.B.detach().requires_grad_(True)
         if self.offload_adapters:
@@ -82829,7 +83098,7 @@ class DynamicContentFilter:
                 reader.close()
                 self._ip_cache[ip] = country
                 return country
-        except: pass
+        except Exception: pass
         return 'default'
 
     def filter(self, text, ip_address=None, country_code='default'):
@@ -83183,7 +83452,7 @@ class ProgressTracker:
                 self.redis.ping()
                 if use_pubsub:
                     self.pubsub = self.redis.pubsub()
-            except:
+            except Exception:
                 self.use_redis = False
                 self.redis = None
                 self.pubsub = None
@@ -83507,7 +83776,7 @@ class PromptCompressor:
                 nltk.download('stopwords', quiet=True)
                 from nltk.corpus import stopwords as sw
                 self.stopwords = set(sw.words('english'))
-            except:
+            except Exception:
                 pass
 
     def compress(self, prompt, return_importance=False):
@@ -83613,7 +83882,7 @@ class ABTestManager:
                 self.rewards['a'] = deque(data.get('rewards_a', []), maxlen=self.metrics_window)
                 self.rewards['b'] = deque(data.get('rewards_b', []), maxlen=self.metrics_window)
                 self._update_averages()
-        except:
+        except Exception:
             pass
 
     def _save_stats(self):
@@ -84012,7 +84281,7 @@ class VoiceCommandProcessor:
         try:
             self.tts_engine.tts_to_file(text=text, file_path=output_path)
             return True
-        except:
+        except Exception:
             return False
 
     def process_command(self, audio_path):
@@ -84068,7 +84337,7 @@ class PowerCostMonitor:
             try:
                 pynvml.nvmlInit()
                 self._nvml_handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(gpu_count)]
-            except:
+            except Exception:
                 self.enable_nvml = False
 
     def _get_real_time_power(self):
@@ -84644,7 +84913,7 @@ class MusicComposerReal:
             processor = AutoProcessor.from_pretrained(model_name)
             model = MusicgenForConditionalGeneration.from_pretrained(model_name).to(self.device)
             return {'model': model, 'processor': processor}
-        except:
+        except Exception:
             return None
 
     def generate_music(self, mood, duration_sec, sample_rate=None):
@@ -84742,7 +85011,7 @@ class LipSyncEngine(nn.Module):
         try:
             import wav2lip
             return wav2lip.Wav2Lip(pretrained=True).to(self.device)
-        except:
+        except Exception:
             return None
 
     def _extract_audio_features(self, audio_chunk, sample_rate=16000):
@@ -84771,7 +85040,7 @@ class ParallaxEngine(nn.Module):
         try:
             import midas
             return midas.MidasDepthEstimation().to(self.device)
-        except:
+        except Exception:
             return None
 
     def decompose(self, img):
@@ -84811,7 +85080,7 @@ class ExpressionMorpher(nn.Module):
         try:
             import fomm
             return fomm.FirstOrderMotionModel().to(self.device)
-        except:
+        except Exception:
             return None
 
     def apply_expression(self, img, speaker, emotion, progress):
@@ -84840,7 +85109,7 @@ class SubtitleRenderer:
             self.fonts['fa'] = ImageFont.truetype("Vazir.ttf", 28)
             self.fonts['en'] = ImageFont.truetype("arial.ttf", 28)
             self.fonts['ko'] = ImageFont.truetype("NanumGothic.ttf", 28)
-        except:
+        except Exception:
             self.fonts['en'] = ImageFont.load_default()
 
     def render(self, img, text, lang, progress):
@@ -84850,7 +85119,7 @@ class SubtitleRenderer:
             try:
                 import arabic_reshaper
                 text = arabic_reshaper.reshape(text)
-            except:
+            except Exception:
                 pass
             draw.text((img.width//2 - 200, img.height - 60), text, font=font, fill='white', stroke_width=2, stroke_fill='black', direction='rtl')
         else:
@@ -84888,7 +85157,7 @@ class SFXGenerator(nn.Module):
         try:
             from diffusers import AudioLDMPipeline
             return AudioLDMPipeline.from_pretrained(name).to(self.device)
-        except:
+        except Exception:
             return None
 
     def generate_audio_sfx(self, sfx_text, duration=2.0, sample_rate=16000):
@@ -84911,7 +85180,7 @@ class SFXGenerator(nn.Module):
                 font = ImageFont.truetype("NanumGothic.ttf", 40)
             else:
                 font = ImageFont.truetype("arial.ttf", 40)
-        except:
+        except Exception:
             font = ImageFont.load_default()
         x = random.randint(img.width//4, 3*img.width//4)
         y = random.randint(img.height//4, 3*img.height//4)
@@ -84970,7 +85239,7 @@ class SFXLibrary:
                 audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
             self.cache[path] = audio.to(self.device)
             return self.cache[path]
-        except:
+        except Exception:
             return torch.zeros(1, int(self.sample_rate * 2.0), device=self.device)
 
     def get_sfx(self, name, duration, sample_rate=16000, device='cpu'):
@@ -85001,7 +85270,7 @@ class MultilingualSpeechBubble:
         for lang, path in font_paths.items():
             try:
                 self.fonts[lang] = ImageFont.truetype(path, 28)
-            except:
+            except Exception:
                 self.fonts[lang] = ImageFont.load_default()
 
     def add_speech_bubble(self, image, text, lang, speaker='', emotion='neutral', position='auto'):
@@ -85011,7 +85280,7 @@ class MultilingualSpeechBubble:
             try:
                 import arabic_reshaper
                 text = arabic_reshaper.reshape(text)
-            except:
+            except Exception:
                 pass
         bubble_shapes = {'angry': 'spiky', 'sad': 'round', 'surprised': 'spiky', 'neutral': 'round', 'happy': 'round'}
         shape = bubble_shapes.get(emotion, 'round')
@@ -85219,7 +85488,10 @@ class Neural3DHead(nn.Module):
         v_shaped = self.v_template.unsqueeze(0) + torch.einsum('bl,lv->bv', shape_params, self.shapedirs.reshape(-1, self.v_template.shape[0])).reshape(batch_size, -1, 3)
         v_posed = v_shaped
         verts = v_posed
+        # BUGFIX: TexturesVertex was only imported in _init_renderer's local
+        # scope, not here, so this raised NameError on every forward() call.
         from pytorch3d.structures import Meshes
+        from pytorch3d.renderer import TexturesVertex
         mesh = Meshes(verts=verts, faces=self.faces.unsqueeze(0).to(self.device))
         textures = TexturesVertex(verts_features=torch.ones_like(verts) * 0.8)
         mesh.textures = textures
@@ -85235,6 +85507,9 @@ class MultiSessionManager:
         self.sessions = {}
 
     async def create_session(self, session_id, offer):
+        # BUGFIX: av was used inside the nested on_track() closure below but
+        # never imported anywhere in scope.
+        import av
         from aiortc import RTCPeerConnection, RTCSessionDescription
         pc = RTCPeerConnection()
         pc.addTrack(self.avatar._rtc_audio_track)
@@ -85499,6 +85774,10 @@ class RealTimeAvatar(AnimeGenerator):
             self._stream_thread.join(timeout=2.0)
 
     async def handle_webrtc_offer(self, offer, session_id=None):
+        # BUGFIX: av and RTCSessionDescription were used below but never
+        # imported anywhere in this method's scope.
+        import av
+        from aiortc import RTCSessionDescription
         self.pc = self.connection_manager.create_pc(session_id)
         self._running = True
         @self.pc.on("track")
@@ -85561,7 +85840,7 @@ class DreamEngine(nn.Module):
             pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1", torch_dtype=torch.float16).to('cuda')
             pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
             return pipe
-        except:
+        except Exception:
             return None
 
     def _text_to_latent(self, narrative):
@@ -85654,7 +85933,11 @@ class ExpertChoiceRouter(nn.Module):
 
 class AdaptiveKVCompressor(Compressor):
     def __init__(self, args, head_dim, min_ratio=4, max_ratio=16, importance_threshold=0.5, eviction_policy='lfu'):
-        super().__init__(args, compress_ratio=min_ratio, head_dim=head_dim)
+        # BUGFIX: was super().__init__(args, compress_ratio=min_ratio, head_dim=head_dim) --
+        # Compressor.__init__'s first positional param is `dim` (an int), not a
+        # ModelArgs instance, and it has no `head_dim` kwarg at all (TypeError).
+        # This class compresses per attention head, so head_dim is the dim.
+        super().__init__(head_dim, compress_ratio=min_ratio)
         self.min_ratio = min_ratio
         self.max_ratio = max_ratio
         self.importance_predictor = nn.Sequential(
@@ -85665,6 +85948,14 @@ class AdaptiveKVCompressor(Compressor):
         )
         self.register_buffer('access_count', torch.zeros(args.max_batch_size, args.max_seq_len))
         self.register_buffer('last_access_step', torch.zeros(args.max_batch_size, args.max_seq_len, dtype=torch.long))
+        # BUGFIX: kv_cache was read/written in forward()/_evict_tokens() below
+        # but never initialized anywhere -- AttributeError on first forward().
+        # Sized at min_ratio granularity (the smallest compression ratio is
+        # the worst case for number of compressed windows).
+        self.register_buffer(
+            'kv_cache',
+            torch.zeros(args.max_batch_size, args.max_seq_len // min_ratio + 1, self.compressed_dim),
+        )
         self.eviction_policy = eviction_policy
         self.importance_threshold = importance_threshold
         self.step_counter = 0
@@ -85692,7 +85983,11 @@ class AdaptiveKVCompressor(Compressor):
         avg_imp = importance.mean().item()
         self.compress_ratio = int(self.min_ratio + (self.max_ratio - self.min_ratio) * (1.0 - avg_imp))
         self.compress_ratio = max(self.min_ratio, min(self.max_ratio, self.compress_ratio))
-        kv = super().forward(x, start_pos)
+        # BUGFIX: was super().forward(x, start_pos) -- Compressor.forward's
+        # second positional param is return_recon (a bool), not a position
+        # index. start_pos is only needed by this subclass's own
+        # cache-indexing logic below, not by the parent compressor.
+        kv = super().forward(x)
         if kv is not None:
             self.step_counter += 1
             with torch.no_grad():
@@ -85809,7 +86104,9 @@ class Neural3DHeadFull(Neural3DHead):
             vertices_colored = torch.ones_like(self.v_template.unsqueeze(0)) * 0.8
         v_shaped = self.v_template.unsqueeze(0) + torch.einsum('bl,lv->bv', shape, self.shapedirs.reshape(-1, self.v_template.shape[0])).reshape(1, -1, 3)
         verts = v_shaped
+        # BUGFIX: same missing-import pattern as Neural3DHead.forward above.
         from pytorch3d.structures import Meshes
+        from pytorch3d.renderer import TexturesVertex
         mesh = Meshes(verts=verts, faces=self.faces.unsqueeze(0).to(self.device))
         textures = TexturesVertex(verts_features=vertices_colored)
         mesh.textures = textures
