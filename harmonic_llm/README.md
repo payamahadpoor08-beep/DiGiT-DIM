@@ -150,7 +150,19 @@ logits = model(ids, start_pos=0)      # (1, vocab)
 harmonic-llm demo                       # end-to-end smoke test
 harmonic-llm info  --config configs/small.yaml   # parameter breakdown
 harmonic-llm build --config configs/base.yaml    # validate a config
+harmonic-llm generate --prompt "Hello" --max-new-tokens 40   # text generation
 ```
+
+### Training on real text (Persian example)
+
+```bash
+python scripts/fetch_persian.py --target-mb 15     # fa.wikipedia corpus
+python scripts/train_persian.py --max-minutes 38   # train + generate
+```
+
+A CPU run reaches **perplexity 78 vs a chance level of 5000 (64× better)** and
+learns real Persian — see [docs/PERSIAN_RESULTS.md](docs/PERSIAN_RESULTS.md) for
+the full write-up, samples, and honest limitations.
 
 ### Config
 
