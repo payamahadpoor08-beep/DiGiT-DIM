@@ -153,6 +153,8 @@ Five known gaps are being closed here, in phases (see the model-issues plan):
 5. **Many unstrengthened classes in `_core.py`** — a bounded, default-path
    subset is being hardened and tested; the rest are catalogued as a backlog
    (consistent with this repo's rejection of quota-driven "N classes" targets).
+   See `harmonic_llm/docs/BACKLOG.md` for the honest verified/deferred/untested
+   breakdown, including known issues found while fixing the five above.
 
 ## Metrics (honest, as of this session)
 
