@@ -1,0 +1,108 @@
+{
+  "lm": {
+    "before": {
+      "loss": 5.9196670850118,
+      "ppl": 372.2877530702016
+    },
+    "after": {
+      "loss": 1.65716372595893,
+      "ppl": 5.244415131772118
+    },
+    "random_ppl": 259,
+    "steps": 120,
+    "tok_per_sec": 250.0815316253184,
+    "history": [
+      {
+        "step": 30,
+        "val_loss": 1.8189696470896404,
+        "ppl": 6.165502532548651
+      },
+      {
+        "step": 60,
+        "val_loss": 1.6810301144917805,
+        "ppl": 5.371085955853988
+      },
+      {
+        "step": 90,
+        "val_loss": 1.6674888134002686,
+        "ppl": 5.2988446880013385
+      },
+      {
+        "step": 120,
+        "val_loss": 1.6606894334157307,
+        "ppl": 5.2629380392977705
+      }
+    ]
+  },
+  "routing": {
+    "input": "clustered (3 centroids) -- the regime that causes real MoE overflow",
+    "harmonicflow": {
+      "load_imbalance": 0.001300561591051519,
+      "drop_rate": 0.0,
+      "needs_aux_loss": false,
+      "loads": [
+        127.8,
+        127.9,
+        128.1,
+        127.8,
+        128.0,
+        128.3,
+        128.2,
+        127.8
+      ]
+    },
+    "topk_moe": {
+      "load_imbalance": 0.8356062769889832,
+      "drop_rate": 0.1708984375,
+      "needs_aux_loss": true,
+      "loads": [
+        353.0,
+        72.0,
+        321.0,
+        373.0,
+        1.0,
+        319.0,
+        609.0,
+        0.0
+      ]
+    }
+  },
+  "zeromass": [
+    {
+      "dim": 1024,
+      "base_params": 1048576,
+      "resident_params": 10241,
+      "resident_pct": 0.9766578674316406,
+      "adapter_rank": 4,
+      "base_ft_rank": 1,
+      "zero_mass_max_BA": 0.0
+    },
+    {
+      "dim": 2048,
+      "base_params": 4194304,
+      "resident_params": 28676,
+      "resident_pct": 0.6836891174316406,
+      "adapter_rank": 6,
+      "base_ft_rank": 1,
+      "zero_mass_max_BA": 0.0
+    },
+    {
+      "dim": 4096,
+      "base_params": 16777216,
+      "resident_params": 122896,
+      "resident_pct": 0.7325172424316406,
+      "adapter_rank": 14,
+      "base_ft_rank": 1,
+      "zero_mass_max_BA": 0.0
+    },
+    {
+      "dim": 7168,
+      "base_params": 51380224,
+      "resident_params": 358449,
+      "resident_pct": 0.6976400102887835,
+      "adapter_rank": 24,
+      "base_ft_rank": 1,
+      "zero_mass_max_BA": 0.0
+    }
+  ]
+}

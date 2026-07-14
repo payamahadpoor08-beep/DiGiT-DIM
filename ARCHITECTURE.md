@@ -130,6 +130,32 @@ for whoever picks this up next:
   candidate merge needs a human/architectural judgment call on whether the
   overlap is coincidental or structural — not an automatic threshold.
 
+## The `harmonic_llm/` package (added this session)
+
+A self-contained, packaged transformer LM was added under `harmonic_llm/`. It
+shares architectural lineage with `model.py` (same
+`Transformer`/`MultiHeadLatentAttention`/MoE core, plus a HarmonicFlow /
+ZeroMass / Sinkhorn rework) but ships a real productization layer around it:
+`config.py` (validated `ModelConfig` + presets + YAML), `builder.py`
+(`build_model`), `cli.py`, `training.py` (tokenizer + dataset + train loop),
+and a passing `pytest` suite. Unlike the top-level `model.py`, this package is
+importable and runnable in this environment (CPU torch), so it is the surface
+where the active model work happens.
+
+Five known gaps are being closed here, in phases (see the model-issues plan):
+
+1. **MLA (`MultiHeadLatentAttention`) breaks at some head/dim ratios** — opt-in;
+   MoE-attention is the verified default.
+2. **Byte-level tokenizer only** — a real BPE tokenizer is being added.
+3. **No checkpoint/resume** — being added to `training.py`.
+4. **No generation loop** — `Transformer` returns logits only; a real
+   incremental `generate()` + text/CLI glue is being added.
+5. **Many unstrengthened classes in `_core.py`** — a bounded, default-path
+   subset is being hardened and tested; the rest are catalogued as a backlog
+   (consistent with this repo's rejection of quota-driven "N classes" targets).
+   See `harmonic_llm/docs/BACKLOG.md` for the honest verified/deferred/untested
+   breakdown, including known issues found while fixing the five above.
+
 ## Metrics (honest, as of this session)
 
 | | |
