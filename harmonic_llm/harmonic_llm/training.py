@@ -7,9 +7,11 @@ reports throughput. It is what the benchmark script drives.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,6 +50,154 @@ class ByteTokenizer:
 
     def __len__(self) -> int:
         return self.VOCAB_SIZE
+
+
+class BPETokenizer:
+    """
+    A byte-level BPE tokenizer.
+
+    Byte-level BPE learns merges over raw UTF-8 bytes, so:
+
+    * it round-trips *any* text exactly (the base alphabet is all 256 bytes --
+      there is no out-of-vocabulary character and no unknown token), and
+    * it still compresses real text far below one-token-per-byte by merging
+      frequent byte sequences into single tokens.
+
+    Ids are laid out as: ``0..255`` raw bytes, then one id per learned merge, then
+    the specials PAD/BOS/EOS at the top -- so ``BOS``/``EOS`` move with the vocab
+    size and never collide with a byte or a merge. The interface (``encode`` /
+    ``decode`` / ``__len__`` / ``PAD``/``BOS``/``EOS``) matches
+    :class:`ByteTokenizer`, so datasets, generation and the CLI accept either.
+    """
+
+    # Whitespace-vs-non-whitespace pretokeniser. Every character falls in exactly
+    # one class, so the concatenation of the chunks is the original text -- which
+    # is what preserves exact round-tripping. Merges never cross a chunk boundary.
+    _PAT = re.compile(r"\s+|\S+")
+    _N_SPECIALS = 3
+
+    def __init__(self, merges: Optional[List[Tuple[int, int]]] = None):
+        self.merges: List[Tuple[int, int]] = [tuple(m) for m in (merges or [])]
+        self._build()
+
+    def _build(self) -> None:
+        # Base byte alphabet, then expand each merge into the bytes it stands for.
+        self.id2bytes: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+        self.ranks: Dict[Tuple[int, int], int] = {}
+        self.pair2id: Dict[Tuple[int, int], int] = {}
+        for idx, (a, b) in enumerate(self.merges):
+            new_id = 256 + idx
+            self.ranks[(a, b)] = idx
+            self.pair2id[(a, b)] = new_id
+            self.id2bytes[new_id] = self.id2bytes[a] + self.id2bytes[b]
+        self.base_size = 256 + len(self.merges)
+        self.PAD = self.base_size
+        self.BOS = self.base_size + 1
+        self.EOS = self.base_size + 2
+        self.VOCAB_SIZE = self.base_size + self._N_SPECIALS
+
+    # -- BPE core -----------------------------------------------------------
+    @staticmethod
+    def _merge_pair(symbols: List[int], pair: Tuple[int, int], new_id: int) -> List[int]:
+        """Replace every non-overlapping occurrence of ``pair`` with ``new_id``."""
+        out: List[int] = []
+        i = 0
+        n = len(symbols)
+        while i < n:
+            if i < n - 1 and symbols[i] == pair[0] and symbols[i + 1] == pair[1]:
+                out.append(new_id)
+                i += 2
+            else:
+                out.append(symbols[i])
+                i += 1
+        return out
+
+    def _bpe(self, byte_ids: List[int]) -> List[int]:
+        symbols = list(byte_ids)
+        while len(symbols) >= 2:
+            # Merge the adjacent pair with the best (lowest) learned rank first.
+            best_pair = None
+            best_rank = None
+            for i in range(len(symbols) - 1):
+                r = self.ranks.get((symbols[i], symbols[i + 1]))
+                if r is not None and (best_rank is None or r < best_rank):
+                    best_rank = r
+                    best_pair = (symbols[i], symbols[i + 1])
+            if best_pair is None:
+                break
+            symbols = self._merge_pair(symbols, best_pair, self.pair2id[best_pair])
+        return symbols
+
+    # -- public API ---------------------------------------------------------
+    def encode(self, text: str, add_special: bool = True) -> List[int]:
+        ids: List[int] = []
+        for chunk in self._PAT.findall(text):
+            ids.extend(self._bpe(list(chunk.encode("utf-8"))))
+        if add_special:
+            return [self.BOS] + ids + [self.EOS]
+        return ids
+
+    def decode(self, ids: List[int]) -> str:
+        out = bytearray()
+        for i in ids:
+            piece = self.id2bytes.get(i)
+            if piece is not None:            # specials (>= base_size) are skipped
+                out.extend(piece)
+        return out.decode("utf-8", errors="replace")
+
+    def __len__(self) -> int:
+        return self.VOCAB_SIZE
+
+    # -- training -----------------------------------------------------------
+    @classmethod
+    def train(cls, corpus: str, vocab_size: int = 1024) -> "BPETokenizer":
+        """
+        Learn a BPE vocabulary of size ``vocab_size`` from ``corpus``.
+
+        Standard word-frequency BPE: pretokenise, count adjacent byte pairs
+        weighted by word frequency, greedily merge the most frequent pair (ties
+        broken deterministically by pair value so training is reproducible), and
+        repeat until the target vocab size or no mergeable pair remains.
+        """
+        from collections import Counter
+
+        num_merges = max(0, int(vocab_size) - 256 - cls._N_SPECIALS)
+        word_freq = Counter(
+            chunk.encode("utf-8") for chunk in cls._PAT.findall(corpus)
+        )
+        word_syms: Dict[bytes, List[int]] = {w: list(w) for w in word_freq}
+
+        merges: List[Tuple[int, int]] = []
+        for _ in range(num_merges):
+            pair_counts: Counter = Counter()
+            for w, freq in word_freq.items():
+                syms = word_syms[w]
+                for i in range(len(syms) - 1):
+                    pair_counts[(syms[i], syms[i + 1])] += freq
+            if not pair_counts:
+                break
+            # Most frequent pair; deterministic tie-break on the pair itself.
+            best = max(pair_counts, key=lambda p: (pair_counts[p], p))
+            new_id = 256 + len(merges)
+            merges.append(best)
+            for w in word_syms:
+                if len(word_syms[w]) >= 2:
+                    word_syms[w] = cls._merge_pair(word_syms[w], best, new_id)
+
+        return cls(merges=merges)
+
+    # -- persistence --------------------------------------------------------
+    def save(self, path: str) -> str:
+        data = {"version": 1, "merges": [list(m) for m in self.merges]}
+        with open(path, "w") as f:
+            json.dump(data, f)
+        return path
+
+    @classmethod
+    def load(cls, path: str) -> "BPETokenizer":
+        with open(path) as f:
+            data = json.load(f)
+        return cls(merges=[tuple(m) for m in data["merges"]])
 
 
 # ---------------------------------------------------------------------------
