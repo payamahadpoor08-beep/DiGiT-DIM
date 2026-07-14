@@ -206,9 +206,11 @@ harmonic_llm/
 ## Status
 
 Alpha. The architecture runs end-to-end (construction, forward, backward,
-training) and is covered by tests. Multi-head latent attention has a known
-head-count issue at some dim ratios and is opt-in; the default MoE-attention path
-is the verified one.
+training, generation) and is covered by tests. MoE-attention remains the default;
+multi-head latent attention is opt-in and now fixed — its forward, backward and
+generation are verified across a grid of head/dim ratios
+(`tests/test_mla.py`), and illegal ratios fail loudly at construction rather than
+mid-forward.
 
 ## License
 

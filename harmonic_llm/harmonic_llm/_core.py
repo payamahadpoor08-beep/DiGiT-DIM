@@ -763,10 +763,16 @@ def sparse_attn(
 
     # expand برای gather: (B, S, K, H, D)
     idx_exp = safe_idxs.unsqueeze(3).unsqueeze(4).expand(B, S, K_size, H, D)
-    k_exp = k.unsqueeze(1).unsqueeze(3).expand(B, S, -1, H, D)  # (B, S, T, H, D)
+    # Bugfix: k/v are already 4-D (B, T, H, D) here (3-D inputs were expanded to
+    # 4-D above), so a single unsqueeze(1) makes them (B, 1, T, H, D) ready to
+    # broadcast to (B, S, T, H, D). The old code added a second unsqueeze(3),
+    # producing a 6-D tensor that `expand(B, S, -1, H, D)` (5 sizes) could not
+    # accept -- so sparse_attn crashed on every shape, which is why the MLA path
+    # never ran end-to-end.
+    k_exp = k.unsqueeze(1).expand(B, S, -1, H, D)     # (B, S, T, H, D)
     # gather فقط K توکن
     k_sel = k_exp.gather(2, idx_exp)                   # (B, S, K, H, D)
-    v_sel = v.unsqueeze(1).unsqueeze(3).expand(B, S, -1, H, D).gather(2, idx_exp)
+    v_sel = v.unsqueeze(1).expand(B, S, -1, H, D).gather(2, idx_exp)
 
     # محاسبه scores
     q_exp = q.unsqueeze(2)                             # (B, S, 1, H, D)
@@ -790,7 +796,13 @@ def sparse_attn(
     weights = F.softmax(scores.float(), dim=-1).to(q.dtype)  # (B, S, H, K)
 
     # خروجی: وزن‌دار کردن values
-    v_out = (weights.unsqueeze(-1) * v_sel.permute(0, 1, 3, 2, 4)).sum(2)  # (B, S, H, D)
+    # weights: (B, S, H, K, 1); v_sel.permute -> (B, S, H, K, D). The weighted sum
+    # is over the KEY axis K (axis 3), producing one vector per (batch, query, head).
+    # Bugfix: this summed axis 2 (the HEAD axis), collapsing heads and leaving the
+    # key axis in the output -- so the attention output came out shaped
+    # (B, S, K, D) instead of (B, S, H, D), which then broke the grouped output
+    # projection downstream on every head/dim ratio.
+    v_out = (weights.unsqueeze(-1) * v_sel.permute(0, 1, 3, 2, 4)).sum(3)  # (B, S, H, D)
     return v_out
 
 def flash_sparse_attn_func(
@@ -8776,6 +8788,25 @@ class MultiHeadLatentAttention(nn.Module):
         self.nope_head_dim = args.head_dim - args.rope_head_dim
         self.n_groups = args.o_groups
         self.n_local_groups = self.n_groups // world_size
+        # Shape invariants for the grouped output projection and rotary embedding.
+        # These held implicitly for divisor-friendly configs and failed with
+        # cryptic mid-forward errors otherwise; check them loudly at construction.
+        if self.n_groups <= 0 or self.n_heads % self.n_groups != 0:
+            raise ValueError(
+                f"MultiHeadLatentAttention: n_heads ({self.n_heads}) must be "
+                f"divisible by o_groups ({self.n_groups}); the grouped output "
+                f"projection reshapes n_heads*head_dim into o_groups groups."
+            )
+        if self.nope_head_dim < 0:
+            raise ValueError(
+                f"MultiHeadLatentAttention: head_dim ({self.head_dim}) must be "
+                f">= rope_head_dim ({self.rope_head_dim})."
+            )
+        if self.rope_head_dim % 2 != 0:
+            raise ValueError(
+                f"MultiHeadLatentAttention: rope_head_dim ({self.rope_head_dim}) "
+                f"must be even for the rotary embedding."
+            )
         self.latent_dim = args.kv_lora_rank
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
@@ -8790,6 +8821,12 @@ class MultiHeadLatentAttention(nn.Module):
             self.lambda_k = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
             self.lambda_init = args.diff_lambda_init
         self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
+        # Bugfix: attn_sink was never initialised (raw torch.empty), so it carried
+        # arbitrary memory -- risking inf/nan in the attention logits. A zero sink
+        # is the correct neutral default (a per-head constant added across all key
+        # positions cancels in the softmax anyway).
+        with torch.no_grad():
+            nn.init.zeros_(self.attn_sink)
         self.wq_a = Linear(self.dim, self.q_lora_rank)
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim)
@@ -8938,8 +8975,14 @@ class MultiHeadLatentAttention(nn.Module):
                     start_idx += comp_slice
         qr = q = self.q_norm(self.wq_a(x))
         q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        # Bugfix: this was `q *= ...` (in-place) followed by
+        # `apply_rotary_emb(q[..., -rd:], ...)` whose result was *discarded*.
+        # apply_rotary_emb is a pure function (it returns the rotated tensor and
+        # does not mutate its input), so RoPE was silently never applied, and the
+        # in-place `*=` broke autograd. Do both functionally: normalise out of
+        # place, then re-assemble q with its rope slice actually rotated.
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        q = torch.cat([q[..., :-rd], apply_rotary_emb(q[..., -rd:], freqs_cis)], dim=-1)
         kv_input = self.kv_a(x)
         kv_latent = kv_input[..., :self.latent_dim]
         kv_rope = kv_input[..., self.latent_dim:]
@@ -8947,14 +8990,24 @@ class MultiHeadLatentAttention(nn.Module):
         k_nope = self.wk_b(kv_latent).unflatten(-1, (self.n_local_heads, self.nope_head_dim))
         v = self.wv_b(kv_latent).unflatten(-1, (self.n_local_heads, self.head_dim))
         k = torch.cat([k_nope, kv_rope.unsqueeze(2).expand(-1, -1, self.n_local_heads, rd)], dim=-1)
-        apply_rotary_emb(k[..., -rd:], freqs_cis)
-        act_quant_triton(k[..., :-rd], 64, scale_fmt, scale_dtype, True)
+        # Same fix for k: rotate the rope slice (result was discarded before) and
+        # FP8-quantise the nope slice out of place (was inplace=True, which both
+        # broke autograd and mutated a tensor still needed for the backward pass).
+        k_rope = apply_rotary_emb(k[..., -rd:], freqs_cis)
+        k_nope_q, _ = act_quant_triton(k[..., :-rd], 64, scale_fmt, scale_dtype, False)
+        k = torch.cat([k_nope_q, k_rope], dim=-1)
         cache_input = torch.cat([kv_latent, kv_rope], dim=-1)
         atr_mask = None
         attn_temp = None
         if self.atr is not None:
             with torch.no_grad():
-                attn_temp = torch.einsum("bshd,bhtd->bsht", q, k) * self.softmax_scale
+                # q and k are both (B, S, n_heads, head_dim). The scores are
+                # per (query s, head h, key t): einsum over the shared head_dim.
+                # Bugfix: k was labelled "bhtd", which mislabels its seq axis as
+                # the head axis and only broadcasts when seq_len == n_heads --
+                # exactly the "breaks at some dim ratios" MLA symptom. The key's
+                # sequence axis is 't', not 'h'.
+                attn_temp = torch.einsum("bshd,bthd->bsht", q, k) * self.softmax_scale
             atr_mask = self.atr(kv_input, attn_temp)
         topk_idxs = get_window_topk_idxs(win, B, S, start_pos)
         if self.dynamic_topk_enabled:
@@ -9069,9 +9122,12 @@ class MultiHeadLatentAttention(nn.Module):
             self.ext_mem.update(o)
         if self.use_som and self.som is not None:
             o = self.som(o) + o
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        # Inverse-RoPE the output's rope slice (result was discarded before).
+        o = torch.cat([o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs_cis, True)], dim=-1)
         o = o.view(B, S, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        # wo_a is declared bf16; match it to o's dtype so the grouped einsum does
+        # not fail on a float/bf16 mismatch (surfaced once the shapes lined up).
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1).to(o.dtype)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return self.wo_b(o.flatten(2))
 
@@ -66183,10 +66239,18 @@ class Transformer(nn.Module):
         if args.q_adaptive:
             bundle_size = max(int(args.q_min_bundle), min(bundle_size, int(args.q_max_bundle)))
 
+        # MLA's grouped output projection reads ``self.wo_a.weight`` directly and
+        # reshapes it into (n_groups, o_lora_rank, ...) in its forward, so wo_a
+        # cannot be swapped for a quantised layer that has no ``.weight``.
+        # Always skip it, regardless of the configured skip list.
+        skip_names = list(args.q_skip_layer_names)
+        if "wo_a" not in skip_names:
+            skip_names.append("wo_a")
+
         if q_mode == "zero_mass":
             replaced = ZeroMassXOX.convert(
                 self,
-                skip_names=list(args.q_skip_layer_names),
+                skip_names=skip_names,
                 mode="hybrid",
                 bundle_size=bundle_size,
                 cache_size=int(args.q_cache_size),
@@ -66211,7 +66275,7 @@ class Transformer(nn.Module):
             mode=unified_mode,
             bundle_size=bundle_size,
             cache_size=int(args.q_cache_size),
-            skip_names=list(args.q_skip_layer_names),
+            skip_names=skip_names,
             base_device=torch.device("cpu"),
             base_dtype=torch.float16,
             **self._q_conversion_kwargs(args),

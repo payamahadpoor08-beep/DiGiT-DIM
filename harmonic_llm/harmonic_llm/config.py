@@ -40,9 +40,10 @@ class ModelConfig:
     flow_hidden: Optional[int] = None          # defaults to dim*2
 
     # -- attention -----------------------------------------------------------
-    # NOTE: MoE attention is the end-to-end-verified default. Multi-head latent
-    # attention has a head-count broadcasting issue at some dim ratios and is
-    # opt-in until fixed.
+    # NOTE: MoE attention is the default. Multi-head latent attention is opt-in
+    # and now fixed (forward/backward/generation verified across head/dim ratios
+    # in tests/test_mla.py). Enable it with use_latent_attention=True and
+    # use_moe_attention=False (MoE takes precedence when both are set).
     use_latent_attention: bool = False
     use_moe_attention: bool = True
     window_size: int = 512
@@ -150,6 +151,26 @@ class ModelConfig:
         group_dim = head_dim * (self.n_heads // o_groups)
         lora = max(1, min(64, dim // 2, group_dim))
 
+        # ``ModelArgs`` defaults a number of heavy, MLA-internal subsystems ON
+        # (use_atr, use_fast_weights, use_flash_sparse, ...), but ModelConfig's
+        # contract is that heavy subsystems are OFF unless explicitly opted into.
+        # A plain ModelConfig therefore must disable them, otherwise the latent-
+        # attention path silently pulls in token reduction / fast-weights /
+        # flash-attn (which needs a GPU kernel) and breaks. These are ignored by
+        # the default MoE-attention path, so turning them off is safe there too.
+        heavy_off: Dict[str, Any] = {
+            "use_atr": False,
+            "use_fast_weights": False,
+            "use_flash_sparse": False,      # flash kernel needs flash-attn/GPU
+        }
+        if self.use_latent_attention and not self.use_moe_attention:
+            # MLA overloads ``use_causal`` to also gate a heavy CausalReasoner
+            # module (distinct from causal *masking*, which MLA gets from its
+            # windowed top-k index construction). Disable that module on the
+            # plain latent path. The MoE path keeps use_causal for its causal
+            # attention masking untouched.
+            heavy_off["use_causal"] = False
+
         return ModelArgs(
             dim=dim,
             n_layers=self.n_layers,
@@ -182,6 +203,7 @@ class ModelConfig:
             use_task_condition=self.use_task_condition,
             dtype=self.dtype,
             q_seed=self.seed,
+            **heavy_off,
         )
 
 
