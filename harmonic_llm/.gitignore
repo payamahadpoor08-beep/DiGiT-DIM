@@ -16,6 +16,10 @@ venv/
 *.safetensors
 checkpoints/
 zeromass_*.base
+# training data + run artifacts (large / derived)
+data/
+runs/
+*.parquet
 .DS_Store
 .idea/
 .vscode/

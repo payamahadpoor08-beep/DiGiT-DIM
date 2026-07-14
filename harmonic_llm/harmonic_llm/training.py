@@ -158,31 +158,65 @@ class BPETokenizer:
         weighted by word frequency, greedily merge the most frequent pair (ties
         broken deterministically by pair value so training is reproducible), and
         repeat until the target vocab size or no mergeable pair remains.
+
+        Uses **incremental** pair counting: rather than rescanning the whole
+        corpus every merge (O(merges x corpus), which is minutes for a few
+        thousand merges), it keeps a live pair->count table and a pair->words
+        index, and after each merge only touches the words that actually
+        contained the merged pair. Output is identical to the naive method (same
+        greedy choice, same deterministic tie-break), just far faster.
         """
-        from collections import Counter
+        from collections import Counter, defaultdict
 
         num_merges = max(0, int(vocab_size) - 256 - cls._N_SPECIALS)
         word_freq = Counter(
             chunk.encode("utf-8") for chunk in cls._PAT.findall(corpus)
         )
-        word_syms: Dict[bytes, List[int]] = {w: list(w) for w in word_freq}
+        # Parallel arrays: symbol lists + their frequencies (index = word id).
+        words: List[List[int]] = [list(w) for w in word_freq]
+        freqs: List[int] = [word_freq[w] for w in word_freq]
+
+        pair_counts: Counter = Counter()
+        where: Dict[Tuple[int, int], set] = defaultdict(set)  # pair -> word indices
+        for i, syms in enumerate(words):
+            f = freqs[i]
+            for a, b in zip(syms, syms[1:]):
+                pair_counts[(a, b)] += f
+                where[(a, b)].add(i)
 
         merges: List[Tuple[int, int]] = []
         for _ in range(num_merges):
-            pair_counts: Counter = Counter()
-            for w, freq in word_freq.items():
-                syms = word_syms[w]
-                for i in range(len(syms) - 1):
-                    pair_counts[(syms[i], syms[i + 1])] += freq
             if not pair_counts:
                 break
             # Most frequent pair; deterministic tie-break on the pair itself.
             best = max(pair_counts, key=lambda p: (pair_counts[p], p))
+            if pair_counts[best] <= 0:
+                break
             new_id = 256 + len(merges)
             merges.append(best)
-            for w in word_syms:
-                if len(word_syms[w]) >= 2:
-                    word_syms[w] = cls._merge_pair(word_syms[w], best, new_id)
+
+            for i in list(where[best]):
+                syms = words[i]
+                f = freqs[i]
+                # Retract this word's current pair contributions...
+                for a, b in zip(syms, syms[1:]):
+                    pc = pair_counts.get((a, b), 0) - f
+                    if pc <= 0:
+                        pair_counts.pop((a, b), None)
+                    else:
+                        pair_counts[(a, b)] = pc
+                    w = where.get((a, b))
+                    if w is not None:
+                        w.discard(i)
+                # ...merge, and re-add the new adjacency counts.
+                merged = cls._merge_pair(syms, best, new_id)
+                words[i] = merged
+                for a, b in zip(merged, merged[1:]):
+                    pair_counts[(a, b)] += f
+                    where[(a, b)].add(i)
+
+            pair_counts.pop(best, None)
+            where.pop(best, None)
 
         return cls(merges=merges)
 
@@ -257,6 +291,9 @@ class TrainConfig:
     checkpoint_dir: Optional[str] = None   # where to write checkpoints (None = off)
     save_every: int = 0                     # steps between checkpoints (0 = only final)
     resume_from: Optional[str] = None       # path to a checkpoint to resume from
+    # -- wall-clock budget ---------------------------------------------------
+    max_seconds: Optional[float] = None     # stop training after this many seconds
+    log_fn: Optional[Any] = None            # optional callable(step, total, loss, lr)
 
 
 @dataclass
@@ -473,8 +510,11 @@ def train(model, train_ds: Dataset, val_ds: Dataset,
     result = TrainResult()
     tokens_seen = 0
     t0 = time.time()
+    stop = False
 
     for epoch in range(start_epoch, cfg.epochs):
+        if stop:
+            break
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
 
@@ -497,6 +537,8 @@ def train(model, train_ds: Dataset, val_ds: Dataset,
             if step % cfg.log_every == 0:
                 result.train_losses.append(loss.item())
                 result.steps.append(step)
+                if cfg.log_fn is not None:
+                    cfg.log_fn(step, total_steps, loss.item(), lr)
 
             if step % cfg.eval_every == 0 or step == total_steps:
                 ev = evaluate(model, val_loader, device)
@@ -505,6 +547,12 @@ def train(model, train_ds: Dataset, val_ds: Dataset,
 
             if cfg.save_every and step % cfg.save_every == 0:
                 _checkpoint(f"step_{step}.pt", epoch)
+
+            # Wall-clock budget: stop cleanly (a final checkpoint is written
+            # below) once the time limit is hit, mid-epoch if necessary.
+            if cfg.max_seconds is not None and (time.time() - t0) >= cfg.max_seconds:
+                stop = True
+                break
 
     _checkpoint("final.pt", cfg.epochs)
 
