@@ -75,6 +75,26 @@ def cmd_demo(args):
     print(f"  one training step OK, loss={loss.item():.4f}")
 
 
+def cmd_generate(args):
+    """Build a model and generate text from a prompt."""
+    import harmonic_llm as hl
+    from harmonic_llm.training import ByteTokenizer, generate_text
+
+    cfg = hl.ModelConfig.from_yaml(args.config) if args.config else hl.ModelConfig.tiny()
+    model = hl.build_model(cfg, device=args.device)
+    tokenizer = ByteTokenizer()
+    text = generate_text(
+        model, tokenizer, args.prompt,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        device=args.device or "cpu",
+    )
+    print(f"{args.prompt}{text}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="harmonic-llm", description="Harmonic-LLM CLI")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -91,6 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     pd = sub.add_parser("demo", help="run the tiny end-to-end demo")
     pd.set_defaults(func=cmd_demo)
+
+    pg = sub.add_parser("generate", help="generate text from a prompt")
+    pg.add_argument("--config", help="path to a YAML config")
+    pg.add_argument("--device", help="torch device (cpu/cuda)")
+    pg.add_argument("--prompt", default="Hello", help="text prompt to continue")
+    pg.add_argument("--max-new-tokens", type=int, default=64, dest="max_new_tokens")
+    pg.add_argument("--temperature", type=float, default=0.8)
+    pg.add_argument("--top-k", type=int, default=0, dest="top_k")
+    pg.add_argument("--top-p", type=float, default=0.0, dest="top_p")
+    pg.set_defaults(func=cmd_generate)
 
     return p
 

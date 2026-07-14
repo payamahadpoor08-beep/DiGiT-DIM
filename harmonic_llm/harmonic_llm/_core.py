@@ -66640,6 +66640,79 @@ class Transformer(nn.Module):
             return logits, guard_scores
         return logits
 
+    @staticmethod
+    def _sample_next_token(logits: torch.Tensor, temperature: float = 1.0,
+                           top_k: int = 0, top_p: float = 0.0) -> torch.Tensor:
+        """
+        Turn a (B, V) logits row into a (B, 1) next-token id.
+
+        ``temperature <= 0`` is greedy (argmax). Otherwise the logits are
+        temperature-scaled and optionally restricted to the top-k highest and/or
+        the smallest nucleus whose cumulative probability first exceeds ``top_p``
+        before a single multinomial draw. The two filters compose: top-k first,
+        then top-p over what survives.
+        """
+        logits = logits.float()
+        if temperature is not None and temperature <= 0:
+            return logits.argmax(dim=-1, keepdim=True)
+        if temperature and temperature != 1.0:
+            logits = logits / temperature
+        if top_k and top_k > 0:
+            k = min(int(top_k), logits.size(-1))
+            kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
+            logits = logits.masked_fill(logits < kth, float("-inf"))
+        if top_p and 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = cumprobs > top_p
+            # Keep the first token that tips over the threshold.
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            remove = remove.scatter(-1, sorted_idx, remove)
+            logits = logits.masked_fill(remove, float("-inf"))
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    @torch.no_grad()
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 100,
+                 temperature: float = 1.0, top_k: int = 0, top_p: float = 0.0,
+                 eos_token_id: Optional[int] = None, task_ids: Optional[torch.Tensor] = None,
+                 session_id: Optional[str] = None) -> torch.Tensor:
+        """
+        Autoregressive token generation.
+
+        Returns the prompt with up to ``max_new_tokens`` sampled ids appended,
+        shape ``(B, prompt_len + n)``.
+
+        Why a full re-run each step rather than an incremental KV-cache step:
+        the default attention path (:class:`MoEAttention`) is stateless -- it
+        keeps no positional cache and re-attends causally over whatever sequence
+        it is handed -- so the only backend-agnostic way to advance one token is
+        to feed the grown sequence and read the last position's logits. That is
+        O(T^2) but correct for every attention backend here (MoE, MLA, dense); a
+        cache-aware fast path can be added per-backend later without changing this
+        contract. Generation runs in eval mode and restores the prior mode after.
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            generated = input_ids
+            for _ in range(max_new_tokens):
+                # Never exceed the model's context window; keep the most recent slice.
+                ctx = generated[:, -self.max_seq_len:]
+                out = self(ctx, start_pos=0, task_ids=task_ids, session_id=session_id)
+                logits = out[0] if isinstance(out, tuple) else out
+                next_logits = logits[:, -1, :]                       # (B, V)
+                next_token = self._sample_next_token(next_logits, temperature, top_k, top_p)
+                next_token = next_token.to(generated.device, dtype=generated.dtype)
+                generated = torch.cat([generated, next_token], dim=1)
+                if eos_token_id is not None and bool((next_token == eos_token_id).all()):
+                    break
+            return generated
+        finally:
+            if was_training:
+                self.train()
+
     def online_self_learning(self, x: torch.Tensor, loss_fn: callable, steps: int = 1):
         for layer in self.layers:
             if layer.use_self_learning:

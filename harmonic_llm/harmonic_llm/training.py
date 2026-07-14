@@ -221,3 +221,42 @@ def train(model, train_ds: Dataset, val_ds: Dataset,
     result.final_val_loss = final["loss"]
     result.final_val_ppl = final["perplexity"]
     return result
+
+
+# ---------------------------------------------------------------------------
+# Text generation
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def generate_text(model, tokenizer, prompt: str, max_new_tokens: int = 100,
+                  temperature: float = 0.8, top_k: int = 0, top_p: float = 0.0,
+                  device: str = "cpu") -> str:
+    """
+    Prompt -> text, tying a tokenizer around ``model.generate``.
+
+    Encodes ``prompt`` (with a leading BOS but *no* trailing EOS -- appending EOS
+    would tell the model the sequence is already finished), samples continuation
+    ids, and decodes only the newly generated ids back to text. The tokenizer's
+    EOS, when it exposes one, is used as the stop id.
+    """
+    model = model.to(device)
+    # The model's embedding only spans ``vocab_size`` rows; a tokenizer may carry
+    # special ids (BOS/EOS) above that (e.g. ByteTokenizer's 257/258 against a
+    # 256-vocab model). Only feed / stop on specials the model can actually index.
+    vocab = getattr(getattr(model, "args", None), "vocab_size", None)
+
+    def _in_vocab(tok):
+        return tok is not None and (vocab is None or 0 <= tok < vocab)
+
+    ids = tokenizer.encode(prompt, add_special=False)
+    bos = getattr(tokenizer, "BOS", None)
+    if _in_vocab(bos):
+        ids = [bos] + ids
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    eos = getattr(tokenizer, "EOS", None)
+    if not _in_vocab(eos):
+        eos = None
+    out = model.generate(input_ids, max_new_tokens=max_new_tokens,
+                         temperature=temperature, top_k=top_k, top_p=top_p,
+                         eos_token_id=eos)
+    new_ids = out[0, input_ids.size(1):].tolist()
+    return tokenizer.decode(new_ids)
