@@ -8,9 +8,11 @@ reports throughput. It is what the benchmark script drives.
 from __future__ import annotations
 
 import math
+import os
+import random
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -101,6 +103,10 @@ class TrainConfig:
     eval_every: int = 100
     device: str = "cpu"
     seed: int = 42
+    # -- checkpointing -------------------------------------------------------
+    checkpoint_dir: Optional[str] = None   # where to write checkpoints (None = off)
+    save_every: int = 0                     # steps between checkpoints (0 = only final)
+    resume_from: Optional[str] = None       # path to a checkpoint to resume from
 
 
 @dataclass
@@ -114,6 +120,107 @@ class TrainResult:
     final_val_loss: float = float("inf")
     final_val_ppl: float = float("inf")
     wall_time: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+CHECKPOINT_FORMAT_VERSION = 1
+
+
+def _config_to_dict(config: Any) -> Optional[Dict[str, Any]]:
+    """Normalise a model config (ModelConfig | dict | None) to a plain dict."""
+    if config is None:
+        return None
+    if hasattr(config, "to_dict"):
+        return config.to_dict()
+    if isinstance(config, dict):
+        return dict(config)
+    return None
+
+
+def save_checkpoint(path: str, model, optimizer=None, step: int = 0, epoch: int = 0,
+                    config: Any = None, tokenizer_meta: Optional[Dict[str, Any]] = None,
+                    extra: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Persist a resumable training checkpoint.
+
+    Writes model weights, optimizer state, the step/epoch counters, the model
+    config, tokenizer descriptor, and RNG states so a run can be picked up
+    exactly where it left off. The write is atomic (temp file + ``os.replace``)
+    so an interrupt mid-save never leaves a truncated, unloadable checkpoint in
+    place -- the whole point of checkpointing is that a crash loses nothing.
+    """
+    payload: Dict[str, Any] = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "step": int(step),
+        "epoch": int(epoch),
+        "config": _config_to_dict(config),
+        "tokenizer_meta": tokenizer_meta,
+        "rng": {
+            "torch": torch.get_rng_state(),
+            "python": random.getstate(),
+        },
+    }
+    if extra:
+        payload["extra"] = extra
+
+    path = str(path)
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)          # atomic on POSIX/NT
+    return path
+
+
+def load_checkpoint(path: str, map_location: str = "cpu") -> Dict[str, Any]:
+    """Load a checkpoint written by :func:`save_checkpoint` into a dict."""
+    # weights_only=False: the payload carries non-tensor metadata (config dict,
+    # RNG states) that the safe loader would reject.
+    return torch.load(str(path), map_location=map_location, weights_only=False)
+
+
+def load_model_state(model, state_dict: Dict[str, Any]) -> None:
+    """
+    Load ``state_dict`` into ``model``, tolerating dynamically-grown parameters.
+
+    Some parameters in this architecture start empty (shape ``[0]``) and only
+    materialise to full size the first time they are used during training -- the
+    two-tier fine-tune adapters (``_ft_rows`` / ``_ft_cols``) are the notable
+    case. A checkpoint taken after training therefore holds sizes a freshly-built
+    model has not allocated yet, and a strict ``load_state_dict`` would reject
+    them. Reallocate those tensors to match the checkpoint before copying, so a
+    crash-and-resume restores into a clean model correctly.
+    """
+    # Reach the live Parameter/buffer objects (state_dict() hands back detached
+    # views, so resizing those would not update the parameter's own shape).
+    live: Dict[str, Any] = dict(model.named_parameters())
+    live.update(dict(model.named_buffers()))
+    for k, v in state_dict.items():
+        p = live.get(k)
+        if p is not None and p.shape != v.shape:
+            p.data = p.data.new_zeros(v.shape)
+    model.load_state_dict(state_dict)
+
+
+def _restore_rng(rng: Optional[Dict[str, Any]]) -> None:
+    if not rng:
+        return
+    torch_state = rng.get("torch")
+    if torch_state is not None:
+        # RNG state must be a CPU ByteTensor regardless of map_location.
+        torch.set_rng_state(torch_state.cpu() if hasattr(torch_state, "cpu") else torch_state)
+    py_state = rng.get("python")
+    if py_state is not None:
+        # JSON/torch round-trips can turn the tuple's nested list back into a
+        # list; random.setstate needs the inner element to be a tuple.
+        try:
+            random.setstate(py_state)
+        except (TypeError, ValueError):
+            pass
 
 
 def _lr_at(step: int, cfg: TrainConfig, total: int) -> float:
@@ -163,9 +270,19 @@ def evaluate(model, loader: DataLoader, device: str, max_batches: int = 8) -> Di
 
 
 def train(model, train_ds: Dataset, val_ds: Dataset,
-          cfg: TrainConfig = TrainConfig()) -> TrainResult:
+          cfg: TrainConfig = TrainConfig(), config: Any = None,
+          tokenizer_meta: Optional[Dict[str, Any]] = None) -> TrainResult:
     """
     Train the model. Returns a full result record for benchmarking.
+
+    If ``cfg.checkpoint_dir`` is set, checkpoints are written every
+    ``cfg.save_every`` steps (and always at the end) via :func:`save_checkpoint`.
+    If ``cfg.resume_from`` points at a checkpoint, model + optimizer + step/epoch
+    counters + RNG are restored and training continues from there.
+
+    ``config`` (the model's ``ModelConfig``) and ``tokenizer_meta`` are recorded
+    into checkpoints so a resume can sanity-check it is reloading a compatible
+    model/tokenizer.
     """
     torch.manual_seed(cfg.seed)
     device = cfg.device
@@ -179,12 +296,35 @@ def train(model, train_ds: Dataset, val_ds: Dataset,
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                             weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
 
-    result = TrainResult()
+    # -- resume ------------------------------------------------------------
+    start_epoch = 0
     step = 0
+    if cfg.resume_from:
+        ckpt = load_checkpoint(cfg.resume_from, map_location=device)
+        load_model_state(model, ckpt["model"])
+        if ckpt.get("optimizer") is not None:
+            opt.load_state_dict(ckpt["optimizer"])
+        step = int(ckpt.get("step", 0))
+        # Saved epoch is the one in progress when the checkpoint was taken; it is
+        # restarted from the top (data is reshuffled), so no partial epoch is
+        # silently skipped.
+        start_epoch = int(ckpt.get("epoch", 0))
+        _restore_rng(ckpt.get("rng"))
+
+    def _checkpoint(name: str, epoch: int):
+        if not cfg.checkpoint_dir:
+            return
+        save_checkpoint(
+            os.path.join(cfg.checkpoint_dir, name),
+            model, optimizer=opt, step=step, epoch=epoch,
+            config=config, tokenizer_meta=tokenizer_meta,
+        )
+
+    result = TrainResult()
     tokens_seen = 0
     t0 = time.time()
 
-    for epoch in range(cfg.epochs):
+    for epoch in range(start_epoch, cfg.epochs):
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
 
@@ -212,6 +352,11 @@ def train(model, train_ds: Dataset, val_ds: Dataset,
                 ev = evaluate(model, val_loader, device)
                 result.val_losses.append(ev["loss"])
                 result.val_perplexities.append(ev["perplexity"])
+
+            if cfg.save_every and step % cfg.save_every == 0:
+                _checkpoint(f"step_{step}.pt", epoch)
+
+    _checkpoint("final.pt", cfg.epochs)
 
     elapsed = time.time() - t0
     final = evaluate(model, val_loader, device)
